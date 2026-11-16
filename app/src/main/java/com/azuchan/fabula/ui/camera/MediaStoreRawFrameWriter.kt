@@ -6,6 +6,7 @@ import android.graphics.ImageFormat
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.DngCreator
 import android.hardware.camera2.TotalCaptureResult
+import android.media.ExifInterface
 import android.media.Image
 import android.os.Environment
 import android.provider.MediaStore
@@ -22,6 +23,7 @@ class MediaStoreRawFrameWriter(context: Context) : RawFrameWriter {
         captureResult: TotalCaptureResult,
         burstId: String,
         frameIndex: Int,
+        orientationDegrees: Int,
     ): String {
         require(image.format == ImageFormat.RAW_SENSOR) {
             "The burst expects RAW_SENSOR buffers."
@@ -46,6 +48,7 @@ class MediaStoreRawFrameWriter(context: Context) : RawFrameWriter {
             output.use { stream ->
                 DngCreator(characteristics, captureResult).use { creator ->
                     creator
+                        .setOrientation(exifOrientation(orientationDegrees))
                         .setDescription("Fabula RAW burst $burstId, frame ${frameIndex + 1}")
                         .writeImage(stream, image)
                 }
@@ -62,5 +65,12 @@ class MediaStoreRawFrameWriter(context: Context) : RawFrameWriter {
             resolver.delete(uri, null, null)
             throw exception
         }
+    }
+
+    private fun exifOrientation(degrees: Int): Int = when ((degrees % 360 + 360) % 360) {
+        90 -> ExifInterface.ORIENTATION_ROTATE_90
+        180 -> ExifInterface.ORIENTATION_ROTATE_180
+        270 -> ExifInterface.ORIENTATION_ROTATE_270
+        else -> ExifInterface.ORIENTATION_NORMAL
     }
 }

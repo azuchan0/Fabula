@@ -63,6 +63,7 @@ fun interface RawFrameWriter {
         captureResult: TotalCaptureResult,
         burstId: String,
         frameIndex: Int,
+        orientationDegrees: Int,
     ): String
 }
 
@@ -198,6 +199,10 @@ class Camera2PreviewController(
     private var lastAutoIso = 100
     private var lastAutoExposureTimeNs = 10_000_000L
     private var lastAutoFocusDistanceDiopters = 0f
+    private var recoveryGeneration: Long? = null
+    private var recoveryAttempts = 0
+    private var recoveryRetryScheduled = false
+    private var recoveryRetryToken = 0L
     private var workerShutdown = false
 
     @Volatile
@@ -229,6 +234,10 @@ class Camera2PreviewController(
             desiredViewWidth = viewWidth
             desiredViewHeight = viewHeight
             generation++
+            recoveryGeneration = null
+            recoveryAttempts = 0
+            recoveryRetryScheduled = false
+            recoveryRetryToken++
             closeActiveResources()
             openDesiredPreviewWhenReady()
         }
@@ -240,6 +249,10 @@ class Camera2PreviewController(
         cameraHandler.post {
             desiredHolder = null
             generation++
+            recoveryGeneration = null
+            recoveryAttempts = 0
+            recoveryRetryScheduled = false
+            recoveryRetryToken++
             closeActiveResources()
             mutableState.value = CameraPreviewState.Idle
             shutdownWorkerIfReleased()
@@ -597,7 +610,7 @@ class Camera2PreviewController(
             }
             if (current.mode == CameraFocusMode.MANUAL) {
                 mutableFocusControls.value = current.copy(
-                    error = "Passe en AF avant de toucher le viseur.",
+                    error = "Switch to autofocus before tapping the viewfinder.",
                 )
                 return@post
             }
@@ -843,7 +856,7 @@ class Camera2PreviewController(
                         cameraDevice = device
                         device.close()
                         if (requestGeneration == generation && !releaseRequested) {
-                            desiredHolder = null
+                            recoveryGeneration = requestGeneration
                             mutableState.value = CameraPreviewState.Error("The camera disconnected.")
                         }
                     }
@@ -853,7 +866,7 @@ class Camera2PreviewController(
                         cameraDevice = device
                         device.close()
                         if (requestGeneration == generation && !releaseRequested) {
-                            desiredHolder = null
+                            recoveryGeneration = requestGeneration
                             mutableState.value = CameraPreviewState.Error(
                                 "Camera2 error (code $error).",
                             )
@@ -862,7 +875,7 @@ class Camera2PreviewController(
 
                     override fun onClosed(device: CameraDevice) {
                         if (cameraDevice === device) cameraDevice = null
-                        openDesiredPreviewWhenReady()
+                        resumeDesiredPreviewAfterClose()
                         shutdownWorkerIfReleased()
                     }
                 },
@@ -870,7 +883,15 @@ class Camera2PreviewController(
             )
         } catch (exception: Exception) {
             cameraOpenPending = false
-            failCurrentRequest(requestGeneration, exception.message ?: "Opening the camera failed.")
+            if (requestGeneration == generation && !releaseRequested) {
+                recoveryGeneration = requestGeneration
+                mutableState.value = CameraPreviewState.Error(
+                    exception.message ?: "Opening the camera failed.",
+                )
+                resumeDesiredPreviewAfterClose()
+            } else {
+                failCurrentRequest(requestGeneration, exception.message ?: "Opening the camera failed.")
+            }
         }
     }
 
@@ -909,6 +930,10 @@ class Camera2PreviewController(
                         displayAspectRatio = config.displayAspectRatio,
                         rawCaptureSize = rawImageReader?.let { config.rawSize },
                     )
+                    recoveryGeneration = null
+                    recoveryAttempts = 0
+                    recoveryRetryScheduled = false
+                    recoveryRetryToken++
                 } catch (exception: Exception) {
                     failCurrentRequest(
                         requestGeneration,
@@ -920,6 +945,19 @@ class Camera2PreviewController(
             override fun onConfigureFailed(session: CameraCaptureSession) {
                 pendingSessionConfigurations--
                 captureSession = session
+                if (rawImageReader != null && isCurrentRequest(requestGeneration, holder) &&
+                    cameraDevice === device
+                ) {
+                    closeRawImageReader()
+                    val fallbackConfig = config.copy(rawSize = null)
+                    activePreviewConfig = fallbackConfig
+                    mutableRawBurstState.value = RawBurstState.Failed(
+                        "RAW session setup failed; preview and JPEG remain available.",
+                    )
+                    session.close()
+                    createPreviewSession(device, holder, fallbackConfig, requestGeneration)
+                    return
+                }
                 if (requestGeneration == generation && !releaseRequested) {
                     desiredHolder = null
                     mutableState.value = CameraPreviewState.Error("Camera2 could not configure the session.")
@@ -935,7 +973,7 @@ class Camera2PreviewController(
 
             override fun onClosed(session: CameraCaptureSession) {
                 if (captureSession === session) captureSession = null
-                openDesiredPreviewWhenReady()
+                resumeDesiredPreviewAfterClose()
                 shutdownWorkerIfReleased()
             }
         }
@@ -988,7 +1026,7 @@ class Camera2PreviewController(
 
         val characteristics = cameraManager.getCameraCharacteristics(cameraId)
         val streamMap = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-            ?: throw IllegalStateException("Camera2 n’a pas fourni de configuration de flux.")
+            ?: throw IllegalStateException("Camera2 did not provide a stream configuration.")
         val outputSizes = streamMap.getOutputSizes(SurfaceHolder::class.java)?.toList().orEmpty()
         if (outputSizes.isEmpty()) {
             throw IllegalStateException("No SurfaceHolder output sizes are available.")
@@ -1507,6 +1545,7 @@ class Camera2PreviewController(
                 captureResult = result,
                 burstId = burst.burstId,
                 frameIndex = frameIndex,
+                orientationDegrees = config.jpegOrientation,
             )
             burst.savedFrames++
         } catch (exception: Exception) {
@@ -1579,6 +1618,60 @@ class Camera2PreviewController(
         mutableCaptureEvents.tryEmit(
             CameraCaptureEvent.RawBurstFinished(burst.burstId, savedFrames, burst.totalFrames),
         )
+    }
+
+    private fun resumeDesiredPreviewAfterClose() {
+        if (releaseRequested) {
+            shutdownWorkerIfReleased()
+            return
+        }
+
+        val holder = desiredHolder ?: return
+        if (cameraOpenPending || cameraDevice != null || captureSession != null ||
+            pendingSessionConfigurations > 0
+        ) {
+            return
+        }
+
+        val failedGeneration = recoveryGeneration
+        if (failedGeneration == null || failedGeneration != generation) {
+            openDesiredPreviewWhenReady()
+            return
+        }
+        if (recoveryRetryScheduled) return
+
+        if (recoveryAttempts >= MAX_CAMERA_RECOVERY_ATTEMPTS) {
+            recoveryGeneration = null
+            desiredHolder = null
+            mutableState.value = CameraPreviewState.Error(
+                "The camera could not recover automatically. Tap Retry camera to try again.",
+            )
+            return
+        }
+
+        recoveryAttempts++
+        recoveryRetryScheduled = true
+        val retryToken = ++recoveryRetryToken
+        val retryGeneration = generation
+        val retryDelayMs = recoveryAttempts * CAMERA_RECOVERY_DELAY_MS
+        mutableState.value = CameraPreviewState.Error(
+            "Camera connection lost. Retrying (${recoveryAttempts}/$MAX_CAMERA_RECOVERY_ATTEMPTS)…",
+        )
+        cameraHandler.postDelayed({
+            if (retryToken != recoveryRetryToken) return@postDelayed
+            recoveryRetryScheduled = false
+            if (retryGeneration != generation || desiredHolder !== holder || releaseRequested) {
+                return@postDelayed
+            }
+            if (cameraOpenPending || cameraDevice != null || captureSession != null ||
+                pendingSessionConfigurations > 0
+            ) {
+                resumeDesiredPreviewAfterClose()
+            } else {
+                recoveryGeneration = null
+                openDesiredPreviewWhenReady()
+            }
+        }, retryDelayMs)
     }
 
     private val previewCaptureCallback = object : CameraCaptureSession.CaptureCallback() {
@@ -1682,6 +1775,8 @@ class Camera2PreviewController(
     )
 
     private companion object {
+        const val CAMERA_RECOVERY_DELAY_MS = 500L
+        const val MAX_CAMERA_RECOVERY_ATTEMPTS = 2
         const val RAW_BURST_DRAIN_TIMEOUT_MS = 15_000L
     }
 }

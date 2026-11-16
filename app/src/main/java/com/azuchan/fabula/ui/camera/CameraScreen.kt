@@ -388,6 +388,25 @@ private fun CameraPreview() {
                     color = MaterialTheme.colorScheme.onSurface,
                     style = MaterialTheme.typography.labelMedium,
                 )
+
+                if (previewState is CameraPreviewState.Error) {
+                    currentHolder?.let { holder ->
+                        Button(
+                            modifier = Modifier.align(Alignment.Center),
+                            enabled = currentViewWidth > 0 && currentViewHeight > 0,
+                            onClick = {
+                                controller.startPreview(
+                                    holder,
+                                    currentDisplayRotation,
+                                    currentViewWidth,
+                                    currentViewHeight,
+                                )
+                            },
+                        ) {
+                            Text("Retry camera")
+                        }
+                    }
+                }
             }
 
             captureMessage?.let { message ->
@@ -450,6 +469,7 @@ private fun CameraPreview() {
                     modifier = Modifier.size(56.dp),
                     shape = CircleShape,
                     contentPadding = PaddingValues(0.dp),
+                    enabled = previewState is CameraPreviewState.Streaming,
                     onClick = { showExposureControls = true },
                 ) {
                     Text("EV")
@@ -561,6 +581,7 @@ private fun CameraPreview() {
                     controls = exposureControls,
                     whiteBalance = whiteBalanceControls,
                     focus = focusControls,
+                    cameraReady = previewState is CameraPreviewState.Streaming,
                     onManualModeChange = controller::setManualExposureEnabled,
                     onExposureCompensationChange = controller::setExposureCompensation,
                     onManualExposureChange = controller::setManualExposure,
@@ -582,6 +603,7 @@ private fun ExposureControlsPanel(
     controls: CameraExposureControls,
     whiteBalance: CameraWhiteBalanceControls,
     focus: CameraFocusControls,
+    cameraReady: Boolean,
     onManualModeChange: (Boolean) -> Unit,
     onExposureCompensationChange: (Int) -> Unit,
     onManualExposureChange: (iso: Int, exposureTimeNs: Long) -> Unit,
@@ -593,6 +615,18 @@ private fun ExposureControlsPanel(
     onFocusDistanceChange: (Float) -> Unit,
     onTriggerAutoFocus: () -> Unit,
 ) {
+    if (!cameraReady) {
+        Text(
+            text = "Camera controls are unavailable until the preview is active.",
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 24.dp, vertical = 16.dp),
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        return
+    }
+
     Column(
         modifier = Modifier
             .fillMaxWidth()
