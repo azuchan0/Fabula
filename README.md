@@ -2,7 +2,6 @@
 
 Fabula is an experimental Android camera app built with **Kotlin**, **Jetpack Compose**, **Material 3**, and the **Camera2 API**. It is being developed with the Pixel 9a as the primary target; available camera features depend on the device and its Camera2 implementation.
 
-**Repository:** [github.com/azuchan0/Fabula](https://github.com/azuchan0/Fabula)
 
 RAW burst capture and DNG export are available when the device supports the required Camera2 stream combination. This feature has not yet been validated across devices.
 
