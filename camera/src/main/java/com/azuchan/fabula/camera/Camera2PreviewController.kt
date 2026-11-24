@@ -19,7 +19,10 @@ import android.hardware.camera2.params.MeteringRectangle
 import android.graphics.ImageFormat
 import android.media.Image
 import android.media.ImageReader
+import android.media.MediaRecorder
+import android.os.ParcelFileDescriptor
 import android.os.Handler
+import android.os.SystemClock
 import android.os.HandlerThread
 import android.os.Looper
 import android.os.Build
@@ -52,6 +55,8 @@ sealed interface CameraPreviewState {
         /** Width / height after accounting for sensor-to-display rotation. */
         val displayAspectRatio: Float,
         val rawCaptureSize: Size?,
+        /** Null when this camera offers no MediaRecorder stream (no video). */
+        val videoCaptureSize: Size? = null,
     ) : CameraPreviewState
     data class Error(val message: String) : CameraPreviewState
 }
@@ -72,6 +77,14 @@ sealed interface CameraCaptureEvent {
         val superResolutionJpegUri: String?,
         val fusionPreviewUri: String?,
     ) : CameraCaptureEvent
+    /** A recording ended; [saved] is false when the file holds no playable video. */
+    data class VideoFinished(val saved: Boolean) : CameraCaptureEvent
+}
+
+sealed interface VideoRecordingState {
+    data object Idle : VideoRecordingState
+    data object Starting : VideoRecordingState
+    data class Recording(val startedAtElapsedMs: Long) : VideoRecordingState
 }
 
 data class RawBurstFinishResult(
@@ -190,6 +203,21 @@ data class CameraFocusControls(
     val error: String? = null,
 )
 
+/** Zoom of the logical back camera; below 1x the HAL switches to the ultra-wide lens. */
+data class CameraZoom(
+    val ratio: Float = 1f,
+    val minRatio: Float = 1f,
+    val maxRatio: Float = 1f,
+)
+
+/** What the sensor is actually doing, read from preview capture results (auto or manual). */
+data class CameraLiveReadout(
+    val iso: Int? = null,
+    val exposureTimeNs: Long? = null,
+    val aperture: Float? = null,
+    val focusDistanceDiopters: Float? = null,
+)
+
 data class CameraFocusTap(
     val xFraction: Float,
     val yFraction: Float,
@@ -244,7 +272,8 @@ class Camera2PreviewController(
 
     private val mutableState = MutableStateFlow<CameraPreviewState>(CameraPreviewState.Idle)
     val state: StateFlow<CameraPreviewState> = mutableState.asStateFlow()
-    private val mutableCaptureEvents = MutableSharedFlow<CameraCaptureEvent>(extraBufferCapacity = 2)
+    // Continuous drive delivers several JPEGs per second; the UI drains them into its own queue.
+    private val mutableCaptureEvents = MutableSharedFlow<CameraCaptureEvent>(extraBufferCapacity = 16)
     val captureEvents: SharedFlow<CameraCaptureEvent> = mutableCaptureEvents.asSharedFlow()
     private val mutableExposureControls = MutableStateFlow(CameraExposureControls())
     val exposureControls: StateFlow<CameraExposureControls> = mutableExposureControls.asStateFlow()
@@ -255,6 +284,15 @@ class Camera2PreviewController(
     val focusControls: StateFlow<CameraFocusControls> = mutableFocusControls.asStateFlow()
     private val mutableFocusTap = MutableStateFlow<CameraFocusTap?>(null)
     val focusTap: StateFlow<CameraFocusTap?> = mutableFocusTap.asStateFlow()
+    // Increments whenever a capture session starts streaming (open, mode switch, recording).
+    private val mutableSessionsStarted = MutableStateFlow(0)
+    val sessionsStarted: StateFlow<Int> = mutableSessionsStarted.asStateFlow()
+    private val mutableZoom = MutableStateFlow(CameraZoom())
+    val zoom: StateFlow<CameraZoom> = mutableZoom.asStateFlow()
+    private val mutableLiveReadout = MutableStateFlow(CameraLiveReadout())
+    val liveReadout: StateFlow<CameraLiveReadout> = mutableLiveReadout.asStateFlow()
+    private var lastReadoutUpdateNs = 0L
+    private var lastActivePhysicalId: String? = null
     private val mutableRawBurstState = MutableStateFlow<RawBurstState>(RawBurstState.Idle)
     val rawBurstState: StateFlow<RawBurstState> = mutableRawBurstState.asStateFlow()
 
@@ -268,6 +306,26 @@ class Camera2PreviewController(
     private var pendingSessionConfigurations = 0
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
+    private val mutableVideoState = MutableStateFlow<VideoRecordingState>(VideoRecordingState.Idle)
+    val videoState: StateFlow<VideoRecordingState> = mutableVideoState.asStateFlow()
+    private var mediaRecorder: MediaRecorder? = null
+    private var recordingOutput: ParcelFileDescriptor? = null
+    // True once the session that includes the recorder surface is configured; every repeating
+    // request must then target the recorder too, or the video stops receiving frames.
+    private var videoSessionActive = false
+    private var continuousToken: Any? = null
+
+    /**
+     * When set, the camera renders into this surface (sized to the preview stream) instead of the
+     * SurfaceView, and the provider draws it to the view itself, e.g. through a GL colour look.
+     * The SurfaceView's buffer is then sized in display orientation.
+     */
+    @Volatile
+    var previewSurfaceProvider: ((Size) -> Surface?)? = null
+    private var jpegsInFlight = 0
+    // A RAW_SENSOR stream pins the logical camera to its main sensor (no ultra-wide below 1x), so
+    // it is only part of the session while the RAW burst mode is selected.
+    private var rawStreamEnabled = true
     private var imageReader: ImageReader? = null
     private var rawImageReader: ImageReader? = null
     private var activePreviewConfig: PreviewConfig? = null
@@ -307,6 +365,22 @@ class Camera2PreviewController(
             ) {
                 return@post
             }
+            // A view that only changes size (not shape) keeps the same preview stream, so the
+            // camera stays open; reopening on every layout pass can feed back into the layout.
+            val cameraActive = cameraOpenPending || cameraDevice != null || captureSession != null ||
+                pendingSessionConfigurations > 0
+            if (cameraActive && desiredHolder === holder &&
+                desiredDisplayRotation == displayRotation &&
+                desiredViewWidth > 0 && desiredViewHeight > 0 && viewWidth > 0 && viewHeight > 0 &&
+                abs(
+                    viewWidth.toDouble() / viewHeight -
+                        desiredViewWidth.toDouble() / desiredViewHeight,
+                ) <= SAME_SHAPE_TOLERANCE
+            ) {
+                desiredViewWidth = viewWidth
+                desiredViewHeight = viewHeight
+                return@post
+            }
 
             desiredHolder = holder
             desiredDisplayRotation = displayRotation
@@ -340,55 +414,84 @@ class Camera2PreviewController(
 
     fun captureJpeg() {
         if (releaseRequested) return
-
         cameraHandler.post {
-            val device = cameraDevice
-            val session = captureSession
-            val reader = imageReader
-            val config = activePreviewConfig
-            if (device == null || session == null || reader == null || config == null) {
-                mutableCaptureEvents.tryEmit(
-                    CameraCaptureEvent.Failed("The preview is not ready."),
-                )
-                return@post
+            Log.i(TAG, "JPEG capture requested")
+            if (!issueJpegCapture()) {
+                Log.w(TAG, "JPEG capture refused: device=${cameraDevice != null} session=${captureSession != null} " +
+                    "reader=${imageReader != null} config=${activePreviewConfig != null} recorder=${mediaRecorder != null}")
+                mutableCaptureEvents.tryEmit(CameraCaptureEvent.Failed("The preview is not ready."))
             }
+        }
+    }
 
-            try {
-                val request = device
-                    .createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
-                    .apply {
-                        addTarget(reader.surface)
-                        set(CaptureRequest.JPEG_ORIENTATION, config.jpegOrientation)
-                        configureFocusRequest(this, config)
-                        configureExposureRequest(this, config)
-                        configureWhiteBalanceRequest(this, config)
+    /**
+     * Continuous drive (CL / CH): one JPEG every [intervalMs] until [stopContinuousCapture]. A frame
+     * is skipped while [MAX_JPEGS_IN_FLIGHT] captures are still being encoded, so a slow encoder
+     * lowers the rate instead of stalling the camera.
+     */
+    fun startContinuousCapture(intervalMs: Long) {
+        if (releaseRequested) return
+        cameraHandler.post {
+            if (continuousToken != null) return@post
+            val token = Any()
+            continuousToken = token
+            fun tick() {
+                if (continuousToken !== token || releaseRequested) return
+                if (jpegsInFlight < MAX_JPEGS_IN_FLIGHT) issueJpegCapture()
+                cameraHandler.postDelayed({ tick() }, intervalMs)
+            }
+            tick()
+        }
+    }
+
+    fun stopContinuousCapture() {
+        cameraHandler.post { continuousToken = null }
+    }
+
+    /** Camera thread: queues one still capture; returns false when the camera cannot take it. */
+    private fun issueJpegCapture(): Boolean {
+        val device = cameraDevice
+        val session = captureSession
+        val reader = imageReader
+        val config = activePreviewConfig
+        if (device == null || session == null || reader == null || config == null || mediaRecorder != null) {
+            return false
+        }
+        return try {
+            val request = device
+                .createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
+                .apply {
+                    addTarget(reader.surface)
+                    set(CaptureRequest.JPEG_ORIENTATION, config.jpegOrientation)
+                    configureFocusRequest(this, config)
+                    configureExposureRequest(this, config)
+                    configureWhiteBalanceRequest(this, config)
+                }
+                .build()
+            jpegsInFlight++
+            session.capture(
+                request,
+                object : CameraCaptureSession.CaptureCallback() {
+                    override fun onCaptureFailed(
+                        session: CameraCaptureSession,
+                        request: CaptureRequest,
+                        failure: CaptureFailure,
+                    ) {
+                        jpegsInFlight = (jpegsInFlight - 1).coerceAtLeast(0)
+                        mutableCaptureEvents.tryEmit(
+                            CameraCaptureEvent.Failed("Camera capture failed (reason ${failure.reason})."),
+                        )
                     }
-                    .build()
-
-                session.capture(
-                    request,
-                    object : CameraCaptureSession.CaptureCallback() {
-                        override fun onCaptureFailed(
-                            session: CameraCaptureSession,
-                            request: CaptureRequest,
-                            failure: CaptureFailure,
-                        ) {
-                            mutableCaptureEvents.tryEmit(
-                                CameraCaptureEvent.Failed(
-                                    "Camera capture failed (reason ${failure.reason}).",
-                                ),
-                            )
-                        }
-                    },
-                    cameraHandler,
-                )
-            } catch (exception: Exception) {
-                mutableCaptureEvents.tryEmit(
-                    CameraCaptureEvent.Failed(
-                        exception.message ?: "Could not capture the photo.",
-                    ),
-                )
-            }
+                },
+                cameraHandler,
+            )
+            true
+        } catch (exception: Exception) {
+            jpegsInFlight = (jpegsInFlight - 1).coerceAtLeast(0)
+            mutableCaptureEvents.tryEmit(
+                CameraCaptureEvent.Failed(exception.message ?: "Could not capture the photo."),
+            )
+            true
         }
     }
 
@@ -396,7 +499,7 @@ class Camera2PreviewController(
         if (releaseRequested) return
 
         cameraHandler.post {
-            if (activeRawBurst != null) return@post
+            if (activeRawBurst != null || mediaRecorder != null || !rawStreamEnabled) return@post
             val device = cameraDevice
             val session = captureSession
             val reader = rawImageReader
@@ -531,6 +634,123 @@ class Camera2PreviewController(
                     exception.message ?: "Could not start the RAW burst.",
                 )
             }
+        }
+    }
+
+    /**
+     * Starts recording into [output] (an MP4 the caller owns and publishes after [CameraCaptureEvent.VideoFinished]).
+     * The capture session is rebuilt with a recorder surface, so the preview pauses briefly.
+     */
+    fun startVideoRecording(output: ParcelFileDescriptor, withAudio: Boolean) {
+        if (releaseRequested) {
+            output.close()
+            return
+        }
+        cameraHandler.post {
+            val device = cameraDevice
+            val holder = desiredHolder
+            val config = activePreviewConfig
+            if (device == null || holder == null || config == null || captureSession == null ||
+                activeRawBurst != null || mutableVideoState.value != VideoRecordingState.Idle
+            ) {
+                output.close()
+                mutableCaptureEvents.tryEmit(CameraCaptureEvent.Failed("The camera is not ready to record."))
+                return@post
+            }
+            val recorder = try {
+                createRecorder(config, output, withAudio)
+            } catch (exception: Exception) {
+                Log.e(TAG, "Could not prepare the video recorder.", exception)
+                output.close()
+                mutableCaptureEvents.tryEmit(CameraCaptureEvent.Failed("Video recording is unavailable."))
+                return@post
+            }
+            mediaRecorder = recorder
+            recordingOutput = output
+            mutableVideoState.value = VideoRecordingState.Starting
+            createPreviewSession(device, holder, config, generation)
+        }
+    }
+
+    fun stopVideoRecording() {
+        if (releaseRequested) return
+        cameraHandler.post {
+            if (mediaRecorder == null) return@post
+            val saved = finishRecording()
+            mutableCaptureEvents.tryEmit(CameraCaptureEvent.VideoFinished(saved))
+            val device = cameraDevice
+            val holder = desiredHolder
+            val config = activePreviewConfig
+            if (device != null && holder != null && config != null && !releaseRequested) {
+                createPreviewSession(device, holder, config, generation)
+            }
+        }
+    }
+
+    private fun createRecorder(config: PreviewConfig, output: ParcelFileDescriptor, withAudio: Boolean): MediaRecorder {
+        val size = config.videoSize ?: throw IllegalStateException("No video size is available.")
+        return MediaRecorder(appContext).apply {
+            try {
+                if (withAudio) setAudioSource(MediaRecorder.AudioSource.CAMCORDER)
+                setVideoSource(MediaRecorder.VideoSource.SURFACE)
+                setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+                setOutputFile(output.fileDescriptor)
+                setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+                setVideoEncodingBitRate(VIDEO_BIT_RATE)
+                setVideoFrameRate(VIDEO_FRAME_RATE)
+                setVideoSize(size.width, size.height)
+                if (withAudio) {
+                    setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                    setAudioEncodingBitRate(AUDIO_BIT_RATE)
+                    setAudioSamplingRate(AUDIO_SAMPLE_RATE)
+                }
+                setOrientationHint(config.jpegOrientation)
+                prepare()
+            } catch (exception: Exception) {
+                release()
+                throw exception
+            }
+        }
+    }
+
+    /** Stops and releases the recorder (camera thread); returns whether the file is playable. */
+    private fun finishRecording(): Boolean {
+        val recorder = mediaRecorder ?: return false
+        val wasRecording = mutableVideoState.value is VideoRecordingState.Recording
+        videoSessionActive = false
+        runCatching { captureSession?.stopRepeating() }
+        // stop() throws when no frame was ever written; the file is then unusable.
+        val saved = wasRecording && runCatching { recorder.stop() }.isSuccess
+        recorder.release()
+        mediaRecorder = null
+        runCatching { recordingOutput?.close() }
+        recordingOutput = null
+        mutableVideoState.value = VideoRecordingState.Idle
+        return saved
+    }
+
+    /** Adds or removes the RAW stream; the session is rebuilt, so the preview pauses briefly. */
+    fun setRawStreamEnabled(enabled: Boolean) {
+        if (releaseRequested) return
+        cameraHandler.post {
+            if (rawStreamEnabled == enabled) return@post
+            rawStreamEnabled = enabled
+            val device = cameraDevice ?: return@post
+            val holder = desiredHolder ?: return@post
+            val config = activePreviewConfig ?: return@post
+            if (captureSession == null || activeRawBurst != null || mediaRecorder != null) return@post
+            createPreviewSession(device, holder, config, generation)
+        }
+    }
+
+    fun setZoomRatio(ratio: Float) {
+        if (releaseRequested || !ratio.isFinite()) return
+        cameraHandler.post {
+            val current = mutableZoom.value
+            val clamped = ratio.coerceIn(current.minRatio, current.maxRatio)
+            if (clamped == current.ratio) return@post
+            mutableZoom.value = current.copy(ratio = clamped)
+            applyExposureControls()
         }
     }
 
@@ -892,7 +1112,7 @@ class Camera2PreviewController(
                 config.jpegSize.width,
                 config.jpegSize.height,
                 ImageFormat.JPEG,
-                2,
+                MAX_JPEGS_IN_FLIGHT + 1,
             ).apply {
                 setOnImageAvailableListener({ source ->
                     val image = try {
@@ -901,6 +1121,8 @@ class Camera2PreviewController(
                         null
                     } ?: return@setOnImageAvailableListener
 
+                    jpegsInFlight = (jpegsInFlight - 1).coerceAtLeast(0)
+                    Log.i(TAG, "JPEG image received")
                     image.use { jpegImage ->
                         val buffer = jpegImage.planes.firstOrNull()?.buffer
                             ?: return@use
@@ -939,6 +1161,7 @@ class Camera2PreviewController(
         activePreviewConfig = config
         updateExposureCapabilities(config)
         updateWhiteBalanceAndFocusCapabilities(config)
+        updateZoomCapabilities(config)
 
         cameraOpenPending = true
         mutableState.value = CameraPreviewState.Opening
@@ -946,7 +1169,8 @@ class Camera2PreviewController(
         // SurfaceHolder mutates a View-backed surface, so its fixed size must be set on main.
         mainHandler.post {
             try {
-                holder.setFixedSize(config.previewSize.width, config.previewSize.height)
+                val buffer = viewBufferSize(config)
+                holder.setFixedSize(buffer.width, buffer.height)
                 cameraHandler.post {
                     if (requestGeneration != generation || desiredHolder !== holder ||
                         releaseRequested || !holder.surface.isValid
@@ -1061,6 +1285,8 @@ class Camera2PreviewController(
         requestGeneration: Long,
     ) {
         pendingSessionConfigurations++
+        // A pending recorder turns this into a video session: preview + recorder surfaces only.
+        val recorder = mediaRecorder?.takeIf { mutableVideoState.value == VideoRecordingState.Starting }
         val executor = java.util.concurrent.Executor { command ->
             cameraHandler.post(command)
         }
@@ -1069,6 +1295,7 @@ class Camera2PreviewController(
             override fun onConfigured(session: CameraCaptureSession) {
                 pendingSessionConfigurations--
                 captureSession = session
+                videoSessionActive = recorder != null && mediaRecorder === recorder
 
                 if (!isCurrentRequest(requestGeneration, holder) || cameraDevice !== device) {
                     session.close()
@@ -1083,12 +1310,18 @@ class Camera2PreviewController(
                         previewCaptureCallback,
                         cameraHandler,
                     )
+                    if (videoSessionActive && recorder != null) {
+                        recorder.start()
+                        mutableVideoState.value = VideoRecordingState.Recording(SystemClock.elapsedRealtime())
+                    }
                     mutableState.value = CameraPreviewState.Streaming(
                         cameraId = config.cameraId,
                         previewSize = config.previewSize,
                         displayAspectRatio = config.displayAspectRatio,
                         rawCaptureSize = rawImageReader?.let { config.rawSize },
+                        videoCaptureSize = config.videoSize,
                     )
+                    mutableSessionsStarted.value++
                     recoveryGeneration = null
                     recoveryAttempts = 0
                     recoveryRetryScheduled = false
@@ -1104,6 +1337,15 @@ class Camera2PreviewController(
             override fun onConfigureFailed(session: CameraCaptureSession) {
                 pendingSessionConfigurations--
                 captureSession = session
+                if (recorder != null && mediaRecorder === recorder && cameraDevice === device &&
+                    isCurrentRequest(requestGeneration, holder)
+                ) {
+                    finishRecording()
+                    mutableCaptureEvents.tryEmit(CameraCaptureEvent.Failed("The camera cannot record video here."))
+                    session.close()
+                    createPreviewSession(device, holder, config, requestGeneration)
+                    return
+                }
                 if (rawImageReader != null && isCurrentRequest(requestGeneration, holder) &&
                     cameraDevice === device
                 ) {
@@ -1141,15 +1383,19 @@ class Camera2PreviewController(
             fun sessionConfiguration(includeRaw: Boolean) = SessionConfiguration(
                 SessionConfiguration.SESSION_REGULAR,
                 buildList {
-                    add(OutputConfiguration(holder.surface))
-                    add(OutputConfiguration(requireNotNull(imageReader).surface))
-                    if (includeRaw) rawImageReader?.let { add(OutputConfiguration(it.surface)) }
+                    add(OutputConfiguration(previewTarget(holder, config)))
+                    if (recorder != null) {
+                        add(OutputConfiguration(recorder.surface))
+                    } else {
+                        add(OutputConfiguration(requireNotNull(imageReader).surface))
+                        if (includeRaw) rawImageReader?.let { add(OutputConfiguration(it.surface)) }
+                    }
                 },
                 executor,
                 callback,
             )
 
-            val wantsRaw = rawImageReader != null
+            val wantsRaw = rawImageReader != null && recorder == null && rawStreamEnabled
             var sessionConfig = sessionConfiguration(includeRaw = wantsRaw)
             if (wantsRaw && !device.isSessionConfigurationSupported(sessionConfig)) {
                 closeRawImageReader()
@@ -1169,6 +1415,18 @@ class Camera2PreviewController(
                 exception.message ?: "Could not create the Camera2 session.",
             )
         }
+    }
+
+    private fun previewTarget(holder: SurfaceHolder, config: PreviewConfig): Surface =
+        previewSurfaceProvider?.invoke(config.previewSize) ?: holder.surface
+
+    /** The SurfaceView buffer: the stream size, rotated to the display when a provider draws it. */
+    private fun viewBufferSize(config: PreviewConfig): Size {
+        val size = config.previewSize
+        if (previewSurfaceProvider == null) return size
+        val streamLandscape = size.width >= size.height
+        val displayLandscape = config.displayAspectRatio >= 1f
+        return if (streamLandscape == displayLandscape) size else Size(size.height, size.width)
     }
 
     private fun findPreviewConfig(
@@ -1273,7 +1531,27 @@ class Camera2PreviewController(
             jpegOrientation = jpegOrientation,
             displayAspectRatio = previewDisplayAspectRatio,
             rawSize = rawSize,
+            videoSize = chooseVideoSize(streamMap.getOutputSizes(MediaRecorder::class.java)?.toList().orEmpty()),
         )
+    }
+
+    /** 1080p when offered (the most widely supported recorder stream), else the largest up to 1080p. */
+    private fun chooseVideoSize(sizes: List<Size>): Size? =
+        sizes.firstOrNull { it.width == 1920 && it.height == 1080 }
+            ?: sizes.filter { it.width <= 1920 && it.height <= 1080 }.maxByOrNull { it.width.toLong() * it.height }
+
+    private fun updateZoomCapabilities(config: PreviewConfig) {
+        val range = config.characteristics.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
+        val current = mutableZoom.value
+        mutableZoom.value = if (range == null) {
+            CameraZoom()
+        } else {
+            CameraZoom(
+                ratio = current.ratio.coerceIn(range.lower, range.upper),
+                minRatio = range.lower,
+                maxRatio = range.upper,
+            )
+        }
     }
 
     private fun updateExposureCapabilities(config: PreviewConfig) {
@@ -1422,8 +1700,11 @@ class Camera2PreviewController(
         config: PreviewConfig,
         focusModeOverride: CameraFocusMode? = null,
         afTrigger: Int? = null,
-    ): CaptureRequest = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
-        addTarget(holder.surface)
+    ): CaptureRequest = device.createCaptureRequest(
+        if (videoSessionActive) CameraDevice.TEMPLATE_RECORD else CameraDevice.TEMPLATE_PREVIEW,
+    ).apply {
+        addTarget(previewTarget(holder, config))
+        if (videoSessionActive) mediaRecorder?.let { addTarget(it.surface) }
         configureFocusRequest(this, config, focusModeOverride, afTrigger)
         configureExposureRequest(this, config)
         configureWhiteBalanceRequest(this, config)
@@ -1603,6 +1884,10 @@ class Camera2PreviewController(
     ) {
         val controls = mutableExposureControls.value
         val requestKeys = config.characteristics.availableCaptureRequestKeys.toSet()
+        if (CaptureRequest.CONTROL_ZOOM_RATIO in requestKeys) {
+            // RAW bursts always use the main sensor at 1x; RAW_SENSOR ignores the crop anyway.
+            builder.set(CaptureRequest.CONTROL_ZOOM_RATIO, if (lockForBurst) 1f else mutableZoom.value.ratio)
+        }
 
         if (controls.mode == CameraExposureMode.MANUAL && controls.manualSensorSupported) {
             builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
@@ -1991,6 +2276,22 @@ class Camera2PreviewController(
                     lastAutoFocusDistanceDiopters = it
                 }
             }
+            val physicalId = result.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID)
+            if (physicalId != lastActivePhysicalId) {
+                lastActivePhysicalId = physicalId
+                Log.i(TAG, "Active lens: physical camera $physicalId at zoom ${result.get(CaptureResult.CONTROL_ZOOM_RATIO)}")
+            }
+            // A few readout updates per second are enough for the UI and keep recomposition cheap.
+            val now = SystemClock.elapsedRealtimeNanos()
+            if (now - lastReadoutUpdateNs >= READOUT_INTERVAL_NS) {
+                lastReadoutUpdateNs = now
+                mutableLiveReadout.value = CameraLiveReadout(
+                    iso = result.get(CaptureResult.SENSOR_SENSITIVITY),
+                    exposureTimeNs = result.get(CaptureResult.SENSOR_EXPOSURE_TIME),
+                    aperture = result.get(CaptureResult.LENS_APERTURE),
+                    focusDistanceDiopters = result.get(CaptureResult.LENS_FOCUS_DISTANCE),
+                )
+            }
         }
     }
 
@@ -2027,6 +2328,8 @@ class Camera2PreviewController(
     }
 
     private fun closeActiveResources() {
+        continuousToken = null
+        jpegsInFlight = 0
         activeRawBurst?.let { burst ->
             if (!burst.handedOff) {
                 // Frames already copied to the spool are still written and fused; only the frames
@@ -2044,6 +2347,11 @@ class Camera2PreviewController(
                 handOffRawBurst(burst)
             }
             activeRawBurst = null
+        }
+        if (mediaRecorder != null) {
+            // Leaving the app or losing the camera still finalizes what was recorded.
+            val saved = finishRecording()
+            mutableCaptureEvents.tryEmit(CameraCaptureEvent.VideoFinished(saved))
         }
         captureSession?.close()
         cameraDevice?.close()
@@ -2085,6 +2393,7 @@ class Camera2PreviewController(
         val jpegOrientation: Int,
         val displayAspectRatio: Float,
         val rawSize: Size?,
+        val videoSize: Size?,
     )
 
     private companion object {
@@ -2093,5 +2402,12 @@ class Camera2PreviewController(
         const val RAW_BURST_DRAIN_TIMEOUT_MS = 15_000L
         const val TAG = "Camera2PreviewController"
         const val RAW_BYTES_PER_PIXEL = 2
+        const val SAME_SHAPE_TOLERANCE = 0.01
+        const val READOUT_INTERVAL_NS = 200_000_000L
+        const val VIDEO_BIT_RATE = 20_000_000
+        const val MAX_JPEGS_IN_FLIGHT = 3
+        const val VIDEO_FRAME_RATE = 30
+        const val AUDIO_BIT_RATE = 192_000
+        const val AUDIO_SAMPLE_RATE = 48_000
     }
 }

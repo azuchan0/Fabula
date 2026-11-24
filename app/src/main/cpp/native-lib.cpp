@@ -1,4 +1,5 @@
 #include <jni.h>
+#include <android/bitmap.h>
 #include <android/log.h>
 
 #include <algorithm>
@@ -633,6 +634,7 @@ public:
             const jdouble* colorGains,
             const jdouble* colorMatrix,
             const char* spoolPath,
+            const jdouble* noiseModel,
             std::vector<std::uint16_t>& proxy,
             std::vector<ColorProxyPixel>& colorProxy,
             AlignmentResult& result) {
@@ -706,10 +708,15 @@ public:
         double averageBlackLevel = 0.0;
         for (int site = 0; site < 4; ++site) averageBlackLevel += std::max(0.0, blackLevels[site]);
         averageBlackLevel /= 4.0;
+        const ProxyNoise noise = proxyNoise(noiseModel, whiteLevel - averageBlackLevel);
+        staticFallbackEnabled_ = noise.valid;
         std::vector<BlockMotion> blocks = buildBlockMotion(result, width, height, blocksX, blocksY);
         std::vector<float> robustness =
-                buildRobustnessMap(proxy, blocks, blocksX, blocksY, averageBlackLevel);
+                buildRobustnessMap(proxy, blocks, blocksX, blocksY, averageBlackLevel, noise);
         const double robustnessMs = clock.lapMilliseconds();
+        double robustnessSum = 0.0;
+        for (const float value : robustness) robustnessSum += value;
+        const double meanRobustness = robustness.empty() ? 0.0 : robustnessSum / robustness.size();
         accumulateFusion(colorProxy, result, robustness);
         const double fusionMs = clock.lapMilliseconds();
         storeFrame(bytes, width, height, rowStride, pixelStride, cfaChannels, blackLevels,
@@ -718,9 +725,11 @@ public:
         __android_log_print(
                 ANDROID_LOG_INFO, kLogTag,
                 "frame %d: proxy %.0f ms, coarse align %.0f ms, fine align %.0f ms, "
-                "robustness %.0f ms, fusion %.0f ms, store %.0f ms (total %.0f ms)",
+                "robustness %.0f ms, fusion %.0f ms, store %.0f ms (total %.0f ms); "
+                "mean robustness %.2f, noise model %s (shot %.3g, read %.3g DN^2)",
                 frameNumber, proxyMs, coarseMs, refineMs, robustnessMs, fusionMs, storeMs,
-                proxyMs + coarseMs + refineMs + robustnessMs + fusionMs + storeMs);
+                proxyMs + coarseMs + refineMs + robustnessMs + fusionMs + storeMs,
+                meanRobustness, noise.valid ? "sensor" : "fallback", noise.shot, noise.read);
         return true;
     }
 
@@ -746,33 +755,41 @@ public:
             }
             return duplicate;
         };
-        const int tiffOutput = openOutput(tiffDescriptor);
-        if (tiffOutput < 0) return false;
+        // Either output may be absent (-1), not both.
+        if (tiffDescriptor < 0 && jpegDescriptor < 0) return false;
+        const int tiffOutput = tiffDescriptor >= 0 ? openOutput(tiffDescriptor) : -1;
+        if (tiffDescriptor >= 0 && tiffOutput < 0) return false;
         const int jpegOutput = jpegDescriptor >= 0 ? openOutput(jpegDescriptor) : -1;
         if (jpegDescriptor >= 0 && jpegOutput < 0) {
-            close(tiffOutput);
+            if (tiffOutput >= 0) close(tiffOutput);
             return false;
         }
         bool ok;
         {
-            FileDescriptorStreamBuffer tiffBuffer(tiffOutput);
-            std::ostream tiffStream(&tiffBuffer);
+            std::unique_ptr<FileDescriptorStreamBuffer> tiffBuffer;
+            std::unique_ptr<std::ostream> tiffStream;
+            if (tiffOutput >= 0) {
+                tiffBuffer = std::make_unique<FileDescriptorStreamBuffer>(tiffOutput);
+                tiffStream = std::make_unique<std::ostream>(tiffBuffer.get());
+            }
             std::unique_ptr<FileDescriptorStreamBuffer> jpegBuffer;
             std::unique_ptr<std::ostream> jpegStream;
             if (jpegOutput >= 0) {
                 jpegBuffer = std::make_unique<FileDescriptorStreamBuffer>(jpegOutput);
                 jpegStream = std::make_unique<std::ostream>(jpegBuffer.get());
             }
-            ok = writeSuperResolution(&tiffStream, jpegStream.get(), orientation);
-            tiffStream.flush();
-            ok = ok && tiffStream.good();
+            ok = writeSuperResolution(tiffStream.get(), jpegStream.get(), orientation);
+            if (tiffStream) {
+                tiffStream->flush();
+                ok = ok && tiffStream->good();
+            }
             if (jpegStream) {
                 jpegStream->flush();
                 ok = ok && jpegStream->good();
             }
         }
-        ok = ok && fsync(tiffOutput) == 0 && (jpegOutput < 0 || fsync(jpegOutput) == 0);
-        close(tiffOutput);
+        ok = ok && (tiffOutput < 0 || fsync(tiffOutput) == 0) && (jpegOutput < 0 || fsync(jpegOutput) == 0);
+        if (tiffOutput >= 0) close(tiffOutput);
         if (jpegOutput >= 0) close(jpegOutput);
         return ok;
     }
@@ -783,7 +800,7 @@ public:
     // writer thread streams the previous batch while the next one is computed.
     bool writeSuperResolution(std::ostream* tiffOutput, std::ostream* jpegOutput, jint orientation) {
         if (!superResolutionEnabled_ || storedFrames_.empty() || superResolutionWidth_ <= 0 ||
-            superResolutionHeight_ <= 0 || tiffOutput == nullptr) {
+            superResolutionHeight_ <= 0 || (tiffOutput == nullptr && jpegOutput == nullptr)) {
             return false;
         }
         StageClock clock;
@@ -807,7 +824,7 @@ public:
                               static_cast<std::streamsize>(header.size()));
             if (!*jpegOutput) return false;
         }
-        if (!writeTiffHeader(*tiffOutput, orientation)) return false;
+        if (tiffOutput != nullptr && !writeTiffHeader(*tiffOutput, orientation)) return false;
 
         struct BandScratch {
             std::vector<float> sums;
@@ -944,9 +961,11 @@ public:
                 if (!joinWriter()) return false;
                 const std::int64_t rows = std::min(kBatchRows, height - batchStart * kBandRows);
                 const auto writeBatch = [&, batch, rows, batchStart, batchBands, slot]() {
-                    tiffOutput->write(reinterpret_cast<const char*>(batch),
-                                      static_cast<std::streamsize>(static_cast<std::size_t>(rows) * rowPixelBytes));
-                    if (!*tiffOutput) writeFailed = true;
+                    if (tiffOutput != nullptr) {
+                        tiffOutput->write(reinterpret_cast<const char*>(batch),
+                                          static_cast<std::streamsize>(static_cast<std::size_t>(rows) * rowPixelBytes));
+                        if (!*tiffOutput) writeFailed = true;
+                    }
                     if (jpegOutput == nullptr) return;
                     for (std::int64_t i = 0; i < batchBands; ++i) {
                         const std::vector<std::uint8_t>& segment = segments[slot][static_cast<std::size_t>(i)];
@@ -979,7 +998,7 @@ public:
             jpegOutput->flush();
             if (!*jpegOutput) return false;
         }
-        tiffOutput->flush();
+        if (tiffOutput != nullptr) tiffOutput->flush();
         struct rusage usageAfter {};
         getrusage(RUSAGE_SELF, &usageAfter);
         superResolutionFrameCount_ = 0;
@@ -991,11 +1010,12 @@ public:
                 "2x render %lldx%lld from %d/%zu frames%s: bands %.0f ms, total with streaming %.0f ms; "
                 "thread time: accumulate %.0f ms, rows %.0f ms, jpeg %.0f ms; faults %ld major, %ld minor; %u workers",
                 static_cast<long long>(width), static_cast<long long>(height),
-                superResolutionFrameCount_, frameCount, jpegOutput != nullptr ? " (TIFF + JPEG)" : " (TIFF)",
+                superResolutionFrameCount_, frameCount,
+                tiffOutput == nullptr ? " (JPEG)" : jpegOutput != nullptr ? " (TIFF + JPEG)" : " (TIFF)",
                 renderMs, clock.lapMilliseconds(), accumulateNs.load() / 1e6, rowsNs.load() / 1e6,
                 jpegNs.load() / 1e6, usageAfter.ru_majflt - usageBefore.ru_majflt,
                 usageAfter.ru_minflt - usageBefore.ru_minflt, workerCount());
-        return static_cast<bool>(*tiffOutput) && superResolutionFrameCount_ > 0;
+        return (tiffOutput == nullptr || static_cast<bool>(*tiffOutput)) && superResolutionFrameCount_ > 0;
     }
 
     jint superResolutionWidth() const {
@@ -1059,11 +1079,17 @@ private:
         return lookup[std::min<std::uint16_t>(linearSample, 4095)];
     }
 
+    // Linear output -> display: a rational tone curve y = g x / (1 + (g - 1) x) lifts mid-tones
+    // (18% grey gains about +0.65 EV with g = 1.8) and rolls highlights off smoothly into white
+    // instead of clipping them, then the sRGB transfer function.
+    static constexpr double kOutputToneGain = 1.8;
+
     static std::uint8_t encodeSrgb12(double linear) {
         static const std::array<std::uint8_t, 4096> lookup = [] {
             std::array<std::uint8_t, 4096> values{};
             for (std::size_t i = 0; i < values.size(); ++i) {
-                const double value = static_cast<double>(i) / 4095.0;
+                const double input = static_cast<double>(i) / 4095.0;
+                const double value = kOutputToneGain * input / (1.0 + (kOutputToneGain - 1.0) * input);
                 const double srgb = value <= 0.0031308
                         ? 12.92 * value
                         : 1.055 * std::pow(value, 1.0 / 2.4) - 0.055;
@@ -1182,6 +1208,9 @@ private:
         float dx = 0.0f;
         float dy = 0.0f;
         bool valid = false;
+        // False for the static fallback (no alignment found): only the strict noise test can
+        // accept such a block, see motionAt().
+        bool verified = true;
         // Every robustness sample the block's output pixels can read is exactly 1.
         bool fullyRobust = false;
     };
@@ -1228,7 +1257,8 @@ private:
                         width,
                         height,
                         dx,
-                        dy);
+                        dy,
+                        &block.verified);
                 block.dx = static_cast<float>(dx);
                 block.dy = static_cast<float>(dy);
             }
@@ -1260,14 +1290,44 @@ private:
         return static_cast<float>(top + (bottom - top) * fy);
     }
 
+    // Sensor noise in raw DN, from SENSOR_NOISE_PROFILE (variance = S * x + O for a normalized
+    // signal x): variance_DN(signal) = shot * signal + read.
+    struct ProxyNoise {
+        bool valid = false;
+        double shot = 0.0;
+        double read = 0.0;
+    };
+
+    static ProxyNoise proxyNoise(const jdouble* noiseModel, double whiteRange) {
+        ProxyNoise noise;
+        if (noiseModel == nullptr || !std::isfinite(whiteRange) || whiteRange < 1.0) return noise;
+        const double scale = noiseModel[0];
+        const double offset = noiseModel[1];
+        if (!std::isfinite(scale) || !std::isfinite(offset) || scale < 0.0 || offset < 0.0 ||
+            scale + offset <= 0.0) {
+            return noise;
+        }
+        noise.valid = true;
+        noise.shot = scale * whiteRange;
+        noise.read = offset * whiteRange * whiteRange;
+        return noise;
+    }
+
     // Per-proxy-pixel weight in [0, 1]: 1 where the aligned frame agrees with the reference,
     // 0 where it differs beyond a noise- and texture-aware tolerance (moving objects, misalignment).
+    // With the sensor noise model the noise term follows the real exposure (ISO), so dark bursts
+    // are not rejected as motion just because their noise exceeds a fixed guess.
     std::vector<float> buildRobustnessMap(
             const std::vector<std::uint16_t>& current,
             const std::vector<BlockMotion>& blocks,
             std::int64_t blocksX,
             std::int64_t blocksY,
-            double blackLevel) const {
+            double blackLevel,
+            const ProxyNoise& noise) const {
+        // A proxy pixel averages kProxyScale^2 raw samples, and the difference of two frames
+        // doubles the variance; 3 sigma of that difference is accepted as noise.
+        const double differenceVarianceScale =
+                2.0 / static_cast<double>(kProxyScale * kProxyScale);
         const std::int64_t width = proxyWidth_;
         const std::int64_t height = proxyHeight_;
         std::vector<float> agreement(static_cast<std::size_t>(width * height), 0.0f);
@@ -1309,8 +1369,14 @@ private:
                             0.0, localSquares / localCount - localMean * localMean));
                     const double referenceValue = reference_[static_cast<std::size_t>(py * width + px)];
                     const double signal = std::max(0.0, referenceValue - blackLevel);
-                    const double tolerance = 0.05 * signal + 1.5 * std::sqrt(signal + 16.0) +
-                            0.25 * localDeviation + 2.0;
+                    const double noiseTolerance = noise.valid
+                            ? 3.0 * std::sqrt(differenceVarianceScale * (noise.shot * signal + noise.read))
+                            : 1.5 * std::sqrt(signal + 16.0);
+                    // Unverified (static fallback) blocks get no texture or gain allowance: only
+                    // differences explained by sensor noise are accepted.
+                    const double tolerance = motion.verified
+                            ? 0.05 * signal + noiseTolerance + 0.25 * localDeviation + 2.0
+                            : noiseTolerance + 1.0;
                     const double difference = std::abs(static_cast<double>(aligned) - referenceValue);
                     agreement[static_cast<std::size_t>(py * width + px)] = static_cast<float>(
                             std::clamp((2.0 * tolerance - difference) / tolerance, 0.0, 1.0));
@@ -1865,8 +1931,30 @@ private:
             outputRow[offset] = encodeSrgb12(corrected[0]);
             outputRow[offset + 1] = encodeSrgb12(corrected[1]);
             outputRow[offset + 2] = encodeSrgb12(corrected[2]);
+            if (lookEnabled_) applyLook(outputRow + offset);
         }
     }
+
+    // Colour look on display RGB: a 3x3 matrix, then one 8-bit curve per channel.
+    void applyLook(std::uint8_t* rgb) const {
+        const float r = rgb[0];
+        const float g = rgb[1];
+        const float b = rgb[2];
+        for (int c = 0; c < 3; ++c) {
+            const float value = lookMatrix_[c * 3] * r + lookMatrix_[c * 3 + 1] * g + lookMatrix_[c * 3 + 2] * b;
+            const int index = std::clamp(static_cast<int>(std::lround(value)), 0, 255);
+            rgb[c] = lookCurves_[static_cast<std::size_t>(c * 256 + index)];
+        }
+    }
+
+public:
+    void setLook(const float* matrix, const std::uint8_t* curves) {
+        std::copy(matrix, matrix + 9, lookMatrix_.begin());
+        std::copy(curves, curves + 768, lookCurves_.begin());
+        lookEnabled_ = true;
+    }
+
+private:
 
     bool makeProxy(
             const std::uint8_t* bytes,
@@ -2069,7 +2157,9 @@ private:
             std::int64_t coordinateWidth,
             std::int64_t coordinateHeight,
             double& dx,
-            double& dy) const {
+            double& dy,
+            bool* verified = nullptr) const {
+        if (verified != nullptr) *verified = true;
         if (alignment.isReference) {
             dx = 0.0;
             dy = 0.0;
@@ -2117,6 +2207,15 @@ private:
         if (alignment.confidence >= 0.02 && !alignment.reachedSearchLimit) {
             dx = alignment.xCorrectionPixels;
             dy = alignment.yCorrectionPixels;
+            return true;
+        }
+        // Nothing to align on (a near-black or featureless frame): assume no motion and let the
+        // robustness map keep only the pixels that match the reference within sensor noise.
+        // Without a noise model that test cannot be made strict, so the region is dropped.
+        if (staticFallbackEnabled_) {
+            dx = 0.0;
+            dy = 0.0;
+            if (verified != nullptr) *verified = false;
             return true;
         }
         return false;
@@ -2749,6 +2848,11 @@ private:
     std::int64_t referenceWidth_ = 0;
     std::int64_t referenceHeight_ = 0;
     std::vector<std::uint16_t> reference_;
+    bool lookEnabled_ = false;
+    std::array<float, 9> lookMatrix_{1, 0, 0, 0, 1, 0, 0, 0, 1};
+    std::array<std::uint8_t, 768> lookCurves_{};
+    // Set per frame: unaligned regions fall back to zero motion only with a sensor noise model.
+    bool staticFallbackEnabled_ = false;
     std::vector<std::uint16_t> fineReference_;
     std::vector<std::uint16_t> alignReference_;
     std::vector<std::uint16_t> alignWeights_;
@@ -2910,15 +3014,15 @@ Java_com_azuchan_fabula_ui_camera_NativeRawBurstAligner_nativeWriteSuperResoluti
         jobject jpegDescriptor,
         jint orientation) {
     auto* aligner = reinterpret_cast<RawBurstAligner*>(static_cast<std::intptr_t>(handle));
-    if (aligner == nullptr || tiffDescriptor == nullptr) {
-        throwIllegalState(env, "The RAW burst aligner is closed or the TIFF descriptor is null.");
+    if (aligner == nullptr || (tiffDescriptor == nullptr && jpegDescriptor == nullptr)) {
+        throwIllegalState(env, "The RAW burst aligner is closed or no output descriptor was given.");
         return nullptr;
     }
-    const jint tiff = parcelFileDescriptor(env, tiffDescriptor);
-    const jint jpeg = parcelFileDescriptor(env, jpegDescriptor);
+    const jint tiff = tiffDescriptor != nullptr ? parcelFileDescriptor(env, tiffDescriptor) : -1;
+    const jint jpeg = jpegDescriptor != nullptr ? parcelFileDescriptor(env, jpegDescriptor) : -1;
     if (env->ExceptionCheck()) return nullptr;
     try {
-        if (!aligner->writeSuperResolutionToFileDescriptors(tiff, jpegDescriptor != nullptr ? jpeg : -1, orientation)) {
+        if (!aligner->writeSuperResolutionToFileDescriptors(tiff, jpeg, orientation)) {
             return env->NewIntArray(0);
         }
         return superResolutionDimensions(env, aligner);
@@ -2926,6 +3030,26 @@ Java_com_azuchan_fabula_ui_camera_NativeRawBurstAligner_nativeWriteSuperResoluti
         throwOutOfMemory(env, "Could not allocate the bands of the RAW 2x reconstruction.");
         return nullptr;
     }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_azuchan_fabula_ui_camera_NativeRawBurstAligner_nativeSetLook(
+        JNIEnv* env,
+        jobject /* receiver */,
+        jlong handle,
+        jfloatArray matrixArray,
+        jbyteArray curvesArray) {
+    auto* aligner = reinterpret_cast<RawBurstAligner*>(static_cast<std::intptr_t>(handle));
+    if (aligner == nullptr || matrixArray == nullptr || curvesArray == nullptr ||
+        env->GetArrayLength(matrixArray) != 9 || env->GetArrayLength(curvesArray) != 768) {
+        throwIllegalArgument(env, "A look needs a 3x3 matrix and three 256-entry curves.");
+        return;
+    }
+    jfloat matrix[9];
+    jbyte curves[768];
+    env->GetFloatArrayRegion(matrixArray, 0, 9, matrix);
+    env->GetByteArrayRegion(curvesArray, 0, 768, curves);
+    aligner->setLook(matrix, reinterpret_cast<const std::uint8_t*>(curves));
 }
 
 extern "C" JNIEXPORT jdoubleArray JNICALL
@@ -2943,7 +3067,8 @@ Java_com_azuchan_fabula_ui_camera_NativeRawBurstAligner_nativeAddFrame(
         jdouble whiteLevel,
         jdoubleArray colorGainsArray,
         jdoubleArray colorMatrixArray,
-        jstring spoolPath) {
+        jstring spoolPath,
+        jdoubleArray noiseModelArray) {
     auto* aligner = reinterpret_cast<RawBurstAligner*>(static_cast<std::intptr_t>(handle));
     if (aligner == nullptr || buffer == nullptr || cfaChannelsArray == nullptr ||
         blackLevelsArray == nullptr || colorGainsArray == nullptr || colorMatrixArray == nullptr) {
@@ -2975,6 +3100,9 @@ Java_com_azuchan_fabula_ui_camera_NativeRawBurstAligner_nativeAddFrame(
     env->GetDoubleArrayRegion(colorMatrixArray, 0, 9, colorMatrix);
     const std::string spool = javaString(env, spoolPath);
     if (env->ExceptionCheck()) return nullptr;
+    jdouble noiseModel[2];
+    const bool hasNoiseModel = noiseModelArray != nullptr && env->GetArrayLength(noiseModelArray) == 2;
+    if (hasNoiseModel) env->GetDoubleArrayRegion(noiseModelArray, 0, 2, noiseModel);
 
     try {
         std::vector<std::uint16_t> proxy;
@@ -2993,6 +3121,7 @@ Java_com_azuchan_fabula_ui_camera_NativeRawBurstAligner_nativeAddFrame(
                     colorGains,
                     colorMatrix,
                     spool.c_str(),
+                    hasNoiseModel ? noiseModel : nullptr,
                     proxy,
                     colorProxy,
                     alignment)) {
@@ -3073,3 +3202,53 @@ Java_com_azuchan_fabula_ui_camera_NativeRawBurstAligner_destroyAligner(
     auto* aligner = reinterpret_cast<RawBurstAligner*>(static_cast<std::intptr_t>(handle));
     delete aligner;
 }
+
+// Colour look applied in place to an RGBA_8888 Android bitmap: a 3x3 matrix on display RGB, then
+// one 8-bit curve per channel. Rows are spread over the worker threads (a 12 MP photo in ~50 ms).
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_azuchan_fabula_ui_camera_NativeLook_applyLook(
+        JNIEnv* env,
+        jclass /* clazz */,
+        jobject bitmap,
+        jfloatArray matrixArray,
+        jbyteArray curvesArray) {
+    if (bitmap == nullptr || matrixArray == nullptr || curvesArray == nullptr ||
+        env->GetArrayLength(matrixArray) != 9 || env->GetArrayLength(curvesArray) != 768) {
+        return JNI_FALSE;
+    }
+    AndroidBitmapInfo info{};
+    if (AndroidBitmap_getInfo(env, bitmap, &info) != ANDROID_BITMAP_RESULT_SUCCESS ||
+        info.format != ANDROID_BITMAP_FORMAT_RGBA_8888) {
+        return JNI_FALSE;
+    }
+    float matrix[9];
+    std::uint8_t curves[768];
+    env->GetFloatArrayRegion(matrixArray, 0, 9, matrix);
+    env->GetByteArrayRegion(curvesArray, 0, 768, reinterpret_cast<jbyte*>(curves));
+    void* pixels = nullptr;
+    if (AndroidBitmap_lockPixels(env, bitmap, &pixels) != ANDROID_BITMAP_RESULT_SUCCESS || pixels == nullptr) {
+        return JNI_FALSE;
+    }
+    auto* base = static_cast<std::uint8_t*>(pixels);
+    const std::uint32_t width = info.width;
+    const std::uint32_t stride = info.stride;
+    parallelFor(static_cast<std::int64_t>(info.height), 64, [&](std::int64_t rowBegin, std::int64_t rowEnd) {
+        for (std::int64_t y = rowBegin; y < rowEnd; ++y) {
+            std::uint8_t* row = base + static_cast<std::size_t>(y) * stride;
+            for (std::uint32_t x = 0; x < width; ++x) {
+                std::uint8_t* px = row + x * 4;
+                const float r = px[0];
+                const float g = px[1];
+                const float b = px[2];
+                for (int c = 0; c < 3; ++c) {
+                    const float v = matrix[c * 3] * r + matrix[c * 3 + 1] * g + matrix[c * 3 + 2] * b;
+                    const int index = std::clamp(static_cast<int>(v + 0.5f), 0, 255);
+                    px[c] = curves[c * 256 + index];
+                }
+            }
+        }
+    });
+    AndroidBitmap_unlockPixels(env, bitmap);
+    return JNI_TRUE;
+}
+

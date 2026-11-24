@@ -7,8 +7,12 @@
         android:required="true" />
 
     <uses-permission android:name="android.permission.CAMERA" />
-    <!-- Requested at runtime only when the user enables video audio. -->
+    <!-- Requested when the video mode is first selected; videos record silently without it. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- Let the Fabula gallery list photos and videos saved by earlier installs (full or partial access). -->
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VISUAL_USER_SELECTED" />
 
     <application
         android:allowBackup="true"

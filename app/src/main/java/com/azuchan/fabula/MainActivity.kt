@@ -20,10 +20,29 @@ class MainActivity : ComponentActivity() {
             isAppearanceLightNavigationBars = false
         }
 
+        requestHighestRefreshRate()
+
         setContent {
             FabulaTheme {
                 CameraScreen()
             }
+        }
+    }
+
+    /**
+     * Asks for the display's fastest mode at the current resolution (120 Hz on the Pixel 9a), so
+     * dials, zoom and animations track the finger smoothly. The system may still lower it (battery
+     * saver, Smooth Display off).
+     */
+    private fun requestHighestRefreshRate() {
+        val display = display ?: return
+        val current = display.mode
+        val fastest = display.supportedModes
+            .filter { it.physicalWidth == current.physicalWidth && it.physicalHeight == current.physicalHeight }
+            .maxByOrNull { it.refreshRate } ?: return
+        window.attributes = window.attributes.apply {
+            preferredDisplayModeId = fastest.modeId
+            preferredRefreshRate = fastest.refreshRate
         }
     }
 }

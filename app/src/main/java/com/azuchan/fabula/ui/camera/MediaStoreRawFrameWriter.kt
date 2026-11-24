@@ -32,6 +32,9 @@ class MediaStoreRawFrameWriter(context: Context) : RawFrameWriter {
     private var burstAligner: NativeRawBurstAligner? = null
     private var activeBurstOrientationDegrees = 0
     private val burstAlignments = mutableMapOf<String, MutableMap<Int, RawFrameAlignment>>()
+    private val settingsStore = CaptureSettingsStore.get(appContext)
+    // Settings are read once per burst, so changing them mid-burst cannot split its outputs.
+    private var burstSettings = settingsStore.settings.value
     private val dngExecutor = Executors.newSingleThreadExecutor { task ->
         Thread(task, "FabulaDngWriter").apply { isDaemon = true }
     }
@@ -52,12 +55,22 @@ class MediaStoreRawFrameWriter(context: Context) : RawFrameWriter {
     ): String {
         if (activeBurstId != burstId || frameIndex == 0) {
             activeBurstOrientationDegrees = orientationDegrees
+            burstSettings = settingsStore.settings.value
         }
         val frameStart = SystemClock.elapsedRealtime()
-        // The DNG is written on its own thread while this one aligns the same frame; both only
+        val keepDng = when (burstSettings.keepRawFrames) {
+            KeepRawFrames.NONE -> false
+            KeepRawFrames.FIRST -> frameIndex == 0
+            KeepRawFrames.ALL -> true
+        }
+        // A kept DNG is written on its own thread while this one aligns the same frame; both only
         // read the frame buffer, and this call returns once both are done.
-        val dngTask = dngExecutor.submit<String> {
-            writeDng(frame, characteristics, captureResult, burstId, frameIndex, orientationDegrees)
+        val dngTask = if (keepDng) {
+            dngExecutor.submit<String> {
+                writeDng(frame, characteristics, captureResult, burstId, frameIndex, orientationDegrees)
+            }
+        } else {
+            null
         }
         runCatching {
             alignerForBurst(burstId, frameIndex, frame).addFrame(
@@ -70,6 +83,7 @@ class MediaStoreRawFrameWriter(context: Context) : RawFrameWriter {
                     ?: 65535.0,
                 colorGains = colorGains(captureResult),
                 colorMatrix = colorCorrectionMatrix(captureResult),
+                noiseModel = noiseModel(captureResult),
             )
         }.onSuccess { alignment ->
             burstAlignments.getOrPut(burstId) { mutableMapOf() }[frameIndex] = alignment
@@ -78,7 +92,7 @@ class MediaStoreRawFrameWriter(context: Context) : RawFrameWriter {
         }
         val alignDone = SystemClock.elapsedRealtime()
         val uri = try {
-            dngTask.get()
+            dngTask?.get() ?: ""
         } catch (exception: ExecutionException) {
             throw exception.cause as? Exception ?: exception
         }
@@ -144,6 +158,7 @@ class MediaStoreRawFrameWriter(context: Context) : RawFrameWriter {
         var fusionPreviewUri: Uri? = null
         var superResolution: RawFusionTiff? = null
         val orientationDegrees = activeBurstOrientationDegrees
+        val settings = burstSettings
         val finishStart = SystemClock.elapsedRealtime()
         var superResolutionDone = finishStart
         var previewDone = finishStart
@@ -151,7 +166,7 @@ class MediaStoreRawFrameWriter(context: Context) : RawFrameWriter {
             try {
                 val aligner = burstAligner
                     ?: throw IOException("The RAW super-resolution aligner is unavailable.")
-                superResolution = writeSuperResolution(burstId, aligner, orientationDegrees)
+                superResolution = writeSuperResolution(burstId, aligner, orientationDegrees, settings.saveTiff)
             } catch (exception: Exception) {
                 Log.e(TAG, "Could not build the RAW 2x reconstruction for $burstId.", exception)
             }
@@ -168,7 +183,8 @@ class MediaStoreRawFrameWriter(context: Context) : RawFrameWriter {
             activeBurstOrientationDegrees = 0
         }
 
-        fusionPreview?.let { preview ->
+        // The reduced fusion preview is only a fallback for a burst whose 2x render failed.
+        fusionPreview?.takeIf { superResolution?.jpegMediaUri == null }?.let { preview ->
             try {
                 fusionPreviewUri = writeFusionPreviewJpeg(burstId, preview, orientationDegrees)
             } catch (exception: Exception) {
@@ -177,7 +193,8 @@ class MediaStoreRawFrameWriter(context: Context) : RawFrameWriter {
         }
 
         val frames = burstAlignments.remove(burstId)
-        if (frames != null) {
+        // The alignment report only accompanies a burst kept in full, as diagnostic data.
+        if (frames != null && settings.keepRawFrames == KeepRawFrames.ALL) {
             try {
                 writeAlignmentCsv(burstId, frames)
             } catch (exception: Exception) {
@@ -187,7 +204,7 @@ class MediaStoreRawFrameWriter(context: Context) : RawFrameWriter {
         val finishDone = SystemClock.elapsedRealtime()
         Log.i(
             TIMING_TAG,
-            "$burstId finish: 2x TIFF + JPEG ${superResolutionDone - finishStart} ms, " +
+            "$burstId finish: 2x render ${superResolutionDone - finishStart} ms, " +
                 "preview build ${previewDone - superResolutionDone} ms, " +
                 "preview JPEG + CSV ${finishDone - previewDone} ms",
         )
@@ -202,41 +219,39 @@ class MediaStoreRawFrameWriter(context: Context) : RawFrameWriter {
         )
     }
 
+    /** Writes the 2x JPEG, plus the 8-bit TIFF master when [saveTiff] is set. */
     private fun writeSuperResolution(
         burstId: String,
         aligner: NativeRawBurstAligner,
         orientationDegrees: Int,
+        saveTiff: Boolean,
     ): RawFusionTiff {
-        val tiffUri = insertPendingImage(
-            "Fabula_${burstId}_RAW_SuperResolution_2x.tiff",
-            "image/tiff",
-            burstPicturesPath(burstId),
-        )
-        // The JPEG is optional: the TIFF stays the lossless master if it cannot be created.
-        val jpegUri = runCatching {
-            insertPendingImage(
-                "Fabula_${burstId}_RAW_SuperResolution_2x.jpg",
-                "image/jpeg",
-                burstPicturesPath(burstId),
-            )
-        }.onFailure { Log.e(TAG, "Could not create the 2x JPEG entry for $burstId.", it) }.getOrNull()
+        val folder = picturesPath()
+        val jpegUri = insertPendingImage("Fabula_${burstId}_2x.jpg", "image/jpeg", folder)
+        val tiffUri = if (saveTiff) {
+            runCatching { insertPendingImage("Fabula_${burstId}_2x.tiff", "image/tiff", folder) }
+                .onFailure { Log.e(TAG, "Could not create the 2x TIFF entry for $burstId.", it) }
+                .getOrNull()
+        } else {
+            null
+        }
         try {
-            val tiffDescriptor = resolver.openFileDescriptor(tiffUri, "w")
-                ?: throw IOException("Could not open the RAW super-resolution TIFF.")
-            val jpegDescriptor = jpegUri?.let { resolver.openFileDescriptor(it, "w") }
-            val result = tiffDescriptor.use { tiff ->
-                jpegDescriptor.use { jpeg -> aligner.writeSuperResolution(tiff, jpeg, orientationDegrees) }
+            val jpegDescriptor = resolver.openFileDescriptor(jpegUri, "w")
+                ?: throw IOException("Could not open the 2x JPEG.")
+            val tiffDescriptor = tiffUri?.let { resolver.openFileDescriptor(it, "w") }
+            val result = jpegDescriptor.use { jpeg ->
+                tiffDescriptor.use { tiff -> aligner.writeSuperResolution(tiff, jpeg, orientationDegrees) }
             } ?: throw IOException("Could not encode the RAW 2x reconstruction.")
-            publish(tiffUri, "RAW super-resolution TIFF")
-            val publishedJpeg = jpegUri?.takeIf { jpegDescriptor != null }?.let { uri ->
-                publish(uri, "RAW super-resolution JPEG")
+            publish(jpegUri, "2x JPEG")
+            val publishedTiff = tiffUri?.takeIf { tiffDescriptor != null }?.let { uri ->
+                publish(uri, "2x TIFF")
                 uri.toString()
             }
-            if (publishedJpeg == null) jpegUri?.let { resolver.delete(it, null, null) }
-            return result.copy(mediaUri = tiffUri.toString(), jpegMediaUri = publishedJpeg)
+            if (publishedTiff == null) tiffUri?.let { resolver.delete(it, null, null) }
+            return result.copy(mediaUri = publishedTiff, jpegMediaUri = jpegUri.toString())
         } catch (exception: Exception) {
-            resolver.delete(tiffUri, null, null)
-            jpegUri?.let { resolver.delete(it, null, null) }
+            resolver.delete(jpegUri, null, null)
+            tiffUri?.let { resolver.delete(it, null, null) }
             throw exception
         }
     }
@@ -261,6 +276,8 @@ class MediaStoreRawFrameWriter(context: Context) : RawFrameWriter {
         }
     }
 
+    private fun picturesPath() = "${Environment.DIRECTORY_PICTURES}/Fabula"
+
     private fun burstPicturesPath(burstId: String) =
         "${Environment.DIRECTORY_PICTURES}/Fabula/RAW_Burst_$burstId"
 
@@ -275,7 +292,10 @@ class MediaStoreRawFrameWriter(context: Context) : RawFrameWriter {
             if (!superResolutionEnabled) {
                 Log.w(TAG, "Not enough free storage for the 2x RAW reconstruction.")
             }
-            burstAligner = NativeRawBurstAligner(superResolutionEnabled)
+            burstAligner = NativeRawBurstAligner(superResolutionEnabled).apply {
+                val look = ColorLook.entries.firstOrNull { it.name == burstSettings.colorLook } ?: ColorLook.STANDARD
+                if (look != ColorLook.STANDARD) setLook(look.tables())
+            }
             activeBurstId = burstId
         }
         return requireNotNull(burstAligner)
@@ -310,6 +330,17 @@ class MediaStoreRawFrameWriter(context: Context) : RawFrameWriter {
             pattern.getOffsetForIndex(0, 1).toDouble(),
             pattern.getOffsetForIndex(1, 1).toDouble(),
         )
+    }
+
+    // SENSOR_NOISE_PROFILE gives, per CFA channel, variance = scale * x + offset for a normalized
+    // signal x in [0, 1]. The aligner compares channel-mixed proxies, so the channels are averaged.
+    private fun noiseModel(result: TotalCaptureResult): DoubleArray? {
+        val profile = result.get(CaptureResult.SENSOR_NOISE_PROFILE) ?: return null
+        val usable = profile.filter { pair ->
+            pair.first.isFinite() && pair.second.isFinite() && pair.first >= 0.0 && pair.second >= 0.0
+        }
+        if (usable.isEmpty()) return null
+        return doubleArrayOf(usable.map { it.first }.average(), usable.map { it.second }.average())
     }
 
     private fun colorGains(result: TotalCaptureResult): DoubleArray {
@@ -375,13 +406,10 @@ class MediaStoreRawFrameWriter(context: Context) : RawFrameWriter {
         val values = ContentValues().apply {
             put(
                 MediaStore.MediaColumns.DISPLAY_NAME,
-                "Fabula_${burstId}_RAW_FusionPreview_${preview.contributingFrames}frames.jpg",
+                "Fabula_${burstId}_preview.jpg",
             )
             put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
-            put(
-                MediaStore.MediaColumns.RELATIVE_PATH,
-                "${Environment.DIRECTORY_PICTURES}/Fabula/RAW_Burst_$burstId",
-            )
+            put(MediaStore.MediaColumns.RELATIVE_PATH, picturesPath())
             put(MediaStore.MediaColumns.IS_PENDING, 1)
         }
         val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)

@@ -9,25 +9,48 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.hardware.camera2.CameraMetadata
+import android.content.res.Configuration
+import android.media.MediaActionSound
 import android.net.Uri
+import android.os.ParcelFileDescriptor
 import android.os.Environment
 import android.provider.MediaStore
 import android.provider.Settings
+import android.util.Log
 import android.util.Size
 import android.view.MotionEvent
+import android.view.ScaleGestureDetector
 import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import java.io.IOException
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.slideOutVertically
+import androidx.compose.animation.togetherWith
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.animate
+import androidx.compose.ui.graphics.ImageBitmap
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withTimeoutOrNull
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
@@ -44,21 +67,18 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -67,16 +87,19 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
-import androidx.compose.ui.semantics.contentDescription
-import androidx.compose.ui.semantics.semantics
 import androidx.core.content.ContextCompat
 import androidx.core.app.ActivityCompat
 import androidx.lifecycle.Lifecycle
@@ -91,14 +114,18 @@ import com.azuchan.fabula.camera.CameraExposureControls
 import com.azuchan.fabula.camera.CameraExposureMode
 import com.azuchan.fabula.camera.CameraFocusControls
 import com.azuchan.fabula.camera.CameraFocusMode
-import com.azuchan.fabula.camera.CameraFocusTap
 import com.azuchan.fabula.camera.CameraPreviewState
 import com.azuchan.fabula.camera.RawBurstState
+import com.azuchan.fabula.camera.VideoRecordingState
 import com.azuchan.fabula.camera.PhysicalCameraReport
 import com.azuchan.fabula.camera.CameraWhiteBalanceControls
 import com.azuchan.fabula.camera.CameraWhiteBalanceMode
+import com.azuchan.fabula.ui.theme.FabulaColors
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.Locale
 import kotlin.math.exp
@@ -215,64 +242,184 @@ private fun CameraPreview() {
     var currentDisplayRotation by remember { mutableIntStateOf(Surface.ROTATION_0) }
     var currentViewWidth by remember { mutableIntStateOf(0) }
     var currentViewHeight by remember { mutableIntStateOf(0) }
-    var rawBurstFrameCount by remember { mutableIntStateOf(8) }
-    var captureMessage by remember { mutableStateOf<String?>(null) }
-    // The 2x JPEG opens in any gallery; Android has no TIFF decoder, so the TIFF is only offered
-    // when the JPEG could not be written.
-    var savedSuperResolution by remember { mutableStateOf<Pair<Uri, String>?>(null) }
-    var savedPreviewUri by remember { mutableStateOf<Uri?>(null) }
-    var outputOpenError by remember { mutableStateOf<String?>(null) }
+    // The viewfinder keeps the last streamed aspect ratio while the camera reopens. Falling back to
+    // the container shape instead resized the SurfaceView on every reopen, and each resize reopened
+    // the camera again (endless "Opening camera" once a tall burst message made the area landscape).
+    var lastViewfinderAspectRatio by remember { mutableStateOf<Float?>(null) }
+    val streamingAspectRatio = (previewState as? CameraPreviewState.Streaming)?.displayAspectRatio
+    LaunchedEffect(streamingAspectRatio) {
+        if (streamingAspectRatio != null) lastViewfinderAspectRatio = streamingAspectRatio
+    }
+    val portraitScreen = LocalConfiguration.current.orientation != Configuration.ORIENTATION_LANDSCAPE
+    val settingsStore = remember(context) { CaptureSettingsStore.get(context) }
+    val settings by settingsStore.settings.collectAsStateWithLifecycle()
+    var lastCaptureUri by remember { mutableStateOf<Uri?>(null) }
+    var activeParam by remember { mutableStateOf<ProParam?>(null) }
+    var pendingVideoUri by remember { mutableStateOf<Uri?>(null) }
+    var previewSurfaceView by remember { mutableStateOf<SurfaceView?>(null) }
+    var audioPermissionAsked by remember { mutableStateOf(false) }
+    val videoState by controller.videoState.collectAsStateWithLifecycle()
+    val zoom by controller.zoom.collectAsStateWithLifecycle()
+    val audioPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission(),
+        onResult = { },
+    )
+    val liveReadout by controller.liveReadout.collectAsStateWithLifecycle()
+    var toast by remember { mutableStateOf<String?>(null) }
+    var toastSequence by remember { mutableIntStateOf(0) }
     var showDiagnostics by remember { mutableStateOf(false) }
     var showExposureControls by remember { mutableStateOf(false) }
+    var showSettings by rememberSaveable { mutableStateOf(false) }
+    var showGallery by rememberSaveable { mutableStateOf(false) }
+    var galleryVersion by remember { mutableIntStateOf(0) }
+    var latestGalleryUri by remember { mutableStateOf<Uri?>(null) }
+    var timerRemaining by remember { mutableStateOf<Int?>(null) }
+    var timerJob by remember { mutableStateOf<Job?>(null) }
+    val screenScope = rememberCoroutineScope()
+    var lookRenderer by remember { mutableStateOf<LookPreviewRenderer?>(null) }
+    // Kept while their overlay animates out, after the live value has become null.
+    var lastDial by remember { mutableStateOf<DialState?>(null) }
+    var lastStatusMessage by remember { mutableStateOf("") }
+    var veilImage by remember { mutableStateOf<ImageBitmap?>(null) }
+    var veilVisible by remember { mutableStateOf(false) }
+    var veilJob by remember { mutableStateOf<Job?>(null) }
+    var zoomJob by remember { mutableStateOf<Job?>(null) }
+
+    /** Holds a blurred last frame over the viewfinder until the next session streams. */
+    fun veilUntilNextSession() {
+        val view = previewSurfaceView ?: return
+        val startedBefore = controller.sessionsStarted.value
+        veilJob?.cancel()
+        veilJob = screenScope.launch {
+            veilImage = snapshotViewfinder(view) ?: return@launch
+            veilVisible = true
+            withTimeoutOrNull(1_500) { controller.sessionsStarted.first { it != startedBefore } }
+            delay(120) // let the first new frames reach the screen before dissolving
+            veilVisible = false
+        }
+    }
+
+    /** Taps on a lens chip glide there on a log scale, crossing lenses mid-way like a real zoom. */
+    fun glideZoom(target: Float) {
+        zoomJob?.cancel()
+        val start = controller.zoom.value.ratio
+        zoomJob = screenScope.launch {
+            val from = kotlin.math.ln(start)
+            val to = kotlin.math.ln(target)
+            animate(0f, 1f, animationSpec = tween(320, easing = FastOutSlowInEasing)) { fraction, _ ->
+                controller.setZoomRatio(kotlin.math.exp(from + (to - from) * fraction))
+            }
+        }
+    }
+    var shutterFlash by remember { mutableIntStateOf(0) }
+    // Frames taken in the current CL/CH burst; -1 when no burst is running.
+    var continuousShots by remember { mutableIntStateOf(-1) }
+    var continuousHideJob by remember { mutableStateOf<Job?>(null) }
+    var flashVisible by remember { mutableStateOf(false) }
+    LaunchedEffect(shutterFlash) {
+        if (shutterFlash == 0) return@LaunchedEffect
+        flashVisible = true
+        delay(90)
+        flashVisible = false
+    }
+    // Photos are rendered with the selected look off the event collector, so continuous drive
+    // never makes the camera wait for encoding.
+    val jpegQueue = remember { Channel<ByteArray>(Channel.UNLIMITED) }
+    val shutterSound = remember { MediaActionSound() }
+    DisposableEffect(shutterSound) { onDispose { shutterSound.release() } }
+
+    fun showToast(message: String) {
+        toast = message
+        toastSequence++
+    }
+
+    LaunchedEffect(toastSequence) {
+        if (toast != null) {
+            delay(2_500)
+            toast = null
+        }
+    }
+
+    LaunchedEffect(jpegQueue) {
+        // Two workers, so a continuous burst is rendered and saved about twice as fast.
+        repeat(2) {
+            launch {
+                for (bytes in jpegQueue) {
+                    try {
+                        val look = settingsStore.settings.value.look()
+                        val rendered = withContext(Dispatchers.Default) {
+                            renderJpegWithLook(bytes, look, context.cacheDir)
+                        }
+                        lastCaptureUri = saveJpegToMediaStore(context.applicationContext, rendered)
+                        Log.i("FabulaCapture", "Photo saved with look $look (${rendered.size} bytes)")
+                        galleryVersion++
+                    } catch (exception: Exception) {
+                        showToast("Could not save the photo: ${exception.message ?: "unknown error"}")
+                    }
+                }
+            }
+        }
+    }
+
+    LaunchedEffect(galleryVersion) {
+        latestGalleryUri = queryFabulaMedia(context, limit = 1).firstOrNull()?.uri
+    }
 
     LaunchedEffect(controller) {
         controller.captureEvents.collect { event ->
             when (event) {
                 is CameraCaptureEvent.JpegReady -> {
-                    savedSuperResolution = null
-                    savedPreviewUri = null
-                    outputOpenError = null
-                    captureMessage = "Saving photo…"
-                    captureMessage = try {
-                        saveJpegToMediaStore(context.applicationContext, event.bytes)
-                        "Photo saved to Pictures/Fabula"
-                    } catch (exception: Exception) {
-                        "Failed to save photo: ${exception.message ?: "unknown error"}"
+                    jpegQueue.trySend(event.bytes)
+                    // In CL/CH every frame blinks the viewfinder, clicks, and counts.
+                    if (continuousShots >= 0) {
+                        continuousShots++
+                        shutterFlash++
+                        if (settingsStore.settings.value.shutterSound) shutterSound.play(MediaActionSound.SHUTTER_CLICK)
                     }
                 }
 
                 is CameraCaptureEvent.Failed -> {
-                    captureMessage = "Capture failed: ${event.message}"
+                    showToast(event.message)
+                    val orphan = pendingVideoUri
+                    if (orphan != null && controller.videoState.value == VideoRecordingState.Idle) {
+                        pendingVideoUri = null
+                        withContext(Dispatchers.IO) { context.contentResolver.delete(orphan, null, null) }
+                    }
                 }
 
-                is CameraCaptureEvent.RawBurstProgress -> {
-                    if (event.savedFrames == 0) {
-                        savedSuperResolution = null
-                        savedPreviewUri = null
-                        outputOpenError = null
+                is CameraCaptureEvent.RawBurstProgress -> Unit
+
+                is CameraCaptureEvent.VideoFinished -> {
+                    val uri = pendingVideoUri
+                    pendingVideoUri = null
+                    if (uri != null) {
+                        if (event.saved && publishMediaEntry(context, uri)) {
+                            lastCaptureUri = uri
+                            galleryVersion++
+                        } else {
+                            withContext(Dispatchers.IO) { context.contentResolver.delete(uri, null, null) }
+                            showToast("Video failed")
+                        }
                     }
                 }
 
                 is CameraCaptureEvent.RawBurstFinished -> {
-                    savedSuperResolution = event.superResolutionJpegUri?.let { Uri.parse(it) to "image/jpeg" }
-                        ?: event.superResolutionUri?.let { Uri.parse(it) to "image/tiff" }
-                    savedPreviewUri = event.fusionPreviewUri?.let(Uri::parse)
-                    outputOpenError = null
-                    val outputs = buildList {
-                        if (event.superResolutionWidth > 0 && event.superResolutionHeight > 0) {
-                            val megapixels = (event.superResolutionWidth.toLong() *
-                                event.superResolutionHeight + 500_000L) / 1_000_000L
-                            val formats = if (event.superResolutionJpegUri != null) "TIFF + JPEG" else "TIFF"
-                            add("${megapixels} MP 2× $formats prototype (${event.superResolutionFrames} aligned frames)")
-                        }
-                        if (event.fusionPreviewSaved) add("fusion preview")
+                    val jpegUri = event.superResolutionJpegUri?.let(Uri::parse)
+                    if (jpegUri != null && event.superResolutionWidth > 0) {
+                        lastCaptureUri = jpegUri
+                        galleryVersion++
+                        showToast("48MP · ${event.superResolutionWidth} × ${event.superResolutionHeight}")
+                    } else {
+                        val previewUri = event.fusionPreviewUri?.let(Uri::parse)
+                        if (previewUri != null) lastCaptureUri = previewUri
+                        showToast(
+                            if (previewUri != null) {
+                                "48MP failed · preview saved"
+                            } else {
+                                "48MP failed"
+                            },
+                        )
                     }
-                    val fusionMessage = if (outputs.isNotEmpty()) {
-                        " Fusion saved: ${outputs.joinToString(" + ")}."
-                    } else " No fused output could be created."
-                    captureMessage =
-                        "RAW burst complete: ${event.savedFrames}/${event.totalFrames} DNG files saved." +
-                            fusionMessage
                 }
             }
         }
@@ -314,10 +461,127 @@ private fun CameraPreview() {
         }
     }
 
+    val streaming = previewState is CameraPreviewState.Streaming
+    val rawCaptureSize = (previewState as? CameraPreviewState.Streaming)?.rawCaptureSize
+    val burstRun = rawBurstState as? RawBurstState.Capturing
+    val burstBusy = burstRun != null
+    val requestedMode = CaptureMode.entries.firstOrNull { it.name == settings.captureMode } ?: CaptureMode.BURST
+    // A camera session without RAW falls back to photos rather than offering a dead shutter.
+    val captureMode = if (requestedMode == CaptureMode.BURST && streaming && rawCaptureSize == null) {
+        CaptureMode.PHOTO
+    } else {
+        requestedMode
+    }
+    val proControls = ProControls(
+        exposureControls, whiteBalanceControls, focusControls, liveReadout, settings, captureMode,
+        capabilitiesKnown = streaming,
+    )
+    // Modes this phone's camera cannot do stay visible, greyed, with the reason on tap.
+    val unsupportedModes = buildMap {
+        if (streaming && rawCaptureSize == null) put(CaptureMode.BURST, "48MP needs RAW, which this phone doesn't offer")
+        if (streaming && (previewState as? CameraPreviewState.Streaming)?.videoCaptureSize == null) {
+            put(CaptureMode.VIDEO, "Video isn't available on this phone")
+        }
+    }
+    val drive = proControls.drive()
+    // The shutter handlers outlive a composition (gesture coroutines, memoized references), so they
+    // read the mode and drive through State: a captured value would still be the previous mode.
+    val latestMode by rememberUpdatedState(captureMode)
+    val latestDrive by rememberUpdatedState(drive)
+    // Video is recorded without a look, so its viewfinder shows the plain rendering.
+    val previewLook = if (captureMode == CaptureMode.VIDEO) ColorLook.STANDARD else settings.look()
+    LaunchedEffect(previewLook, lookRenderer) { lookRenderer?.setLook(previewLook) }
+
+    fun fireShutter() {
+        if (settings.shutterSound) shutterSound.play(MediaActionSound.SHUTTER_CLICK)
+        // Blink the viewfinder like a shutter curtain: the photo itself is saved a moment later.
+        shutterFlash++
+        activeParam = null
+        if (latestMode == CaptureMode.BURST) {
+            controller.captureRawBurst(frameCount = settings.burstFrames)
+        } else {
+            controller.captureJpeg()
+        }
+    }
+
+    fun onShutterTap() {
+        Log.i("FabulaCapture", "Shutter tapped: mode=$latestMode drive=$latestDrive timer=${timerJob != null}")
+        timerJob?.let { job ->
+            // A second tap during the countdown cancels the self-timer.
+            job.cancel()
+            timerJob = null
+            timerRemaining = null
+            return
+        }
+        if (latestDrive.timerSeconds > 0) {
+            activeParam = null
+            timerJob = screenScope.launch {
+                try {
+                    for (second in latestDrive.timerSeconds downTo 1) {
+                        timerRemaining = second
+                        delay(1_000)
+                    }
+                    timerRemaining = null
+                    fireShutter()
+                } finally {
+                    timerRemaining = null
+                    timerJob = null
+                }
+            }
+        } else {
+            fireShutter()
+        }
+    }
+    val dial = activeParam?.takeIf { streaming && !burstBusy }?.let(proControls::dial)
+    val recording = videoState as? VideoRecordingState.Recording
+    // The 48MP burst reads the main sensor's full RAW frame, so it always runs at 1x.
+    val zoomAllowed = captureMode != CaptureMode.BURST && !burstBusy
+    val pinchEnabled by rememberUpdatedState(zoomAllowed)
+    var previousMode by remember { mutableStateOf<CaptureMode?>(null) }
+    LaunchedEffect(captureMode) {
+        // Entering or leaving 48MP rebuilds the session (RAW stream on/off): veil the pause.
+        val before = previousMode
+        if (before != null && (before == CaptureMode.BURST) != (captureMode == CaptureMode.BURST)) {
+            veilUntilNextSession()
+        }
+        previousMode = captureMode
+        // Only the 48MP mode needs the RAW stream; without it the camera can switch to the ultra-wide.
+        controller.setRawStreamEnabled(captureMode == CaptureMode.BURST)
+        if (captureMode == CaptureMode.BURST) controller.setZoomRatio(1f)
+    }
+
+    LaunchedEffect(captureMode) {
+        if (captureMode == CaptureMode.VIDEO && !audioPermissionAsked &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            audioPermissionAsked = true
+            audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        }
+    }
+
+    fun toggleRecording() {
+        if (videoState != VideoRecordingState.Idle) {
+            veilUntilNextSession()
+            controller.stopVideoRecording()
+            return
+        }
+        val withAudio = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
+        veilUntilNextSession()
+        val entry = runCatching { createVideoEntry(context) }.getOrNull()
+        if (entry == null) {
+            showToast("Video failed")
+            return
+        }
+        pendingVideoUri = entry.first
+        controller.startVideoRecording(entry.second, withAudio)
+    }
+
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color.Black),
+            .background(FabulaColors.Background),
     ) {
         Column(
             modifier = Modifier
@@ -325,6 +589,13 @@ private fun CameraPreview() {
                 .safeDrawingPadding(),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
+            ReadoutStrip(
+                readouts = proControls.readouts(),
+                active = dial?.param,
+                onSelect = { param -> activeParam = if (activeParam == param) null else param },
+                onUnavailable = ::showToast,
+            )
+
             BoxWithConstraints(
                 modifier = Modifier
                     .weight(1f)
@@ -332,7 +603,8 @@ private fun CameraPreview() {
             ) {
                 val viewfinderAspectRatio =
                     (previewState as? CameraPreviewState.Streaming)?.displayAspectRatio
-                        ?: if (maxWidth < maxHeight) 3f / 4f else 4f / 3f
+                        ?: lastViewfinderAspectRatio
+                        ?: if (portraitScreen) 3f / 4f else 4f / 3f
                 val viewportAspectRatio = maxWidth / maxHeight
                 val viewfinderFitsWidth = viewportAspectRatio < viewfinderAspectRatio
                 val viewfinderWidth = if (viewfinderFitsWidth) {
@@ -355,80 +627,250 @@ private fun CameraPreview() {
                         .aspectRatio(viewfinderAspectRatio)
                 }
 
-                AndroidView(
-                    modifier = viewfinderModifier.align(Alignment.Center),
-                    factory = { viewContext ->
-                        val previewView = SurfaceView(viewContext)
-                        previewView.setOnTouchListener { view, event ->
-                            if (event.actionMasked == MotionEvent.ACTION_UP &&
-                                view.width > 0 && view.height > 0
-                            ) {
-                                controller.tapToFocus(
-                                    xFraction = event.x / view.width,
-                                    yFraction = event.y / view.height,
-                                )
+
+                Box(modifier = viewfinderModifier.align(Alignment.Center)) {
+                    AndroidView(
+                        modifier = Modifier.fillMaxSize(),
+                        factory = { viewContext ->
+                            val previewView = SurfaceView(viewContext)
+                            previewSurfaceView = previewView
+                            var pinchRatio = 1f
+                            var pinched = false
+                            val pinchDetector = ScaleGestureDetector(
+                                viewContext,
+                                object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+                                    override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
+                                        pinchRatio = controller.zoom.value.ratio
+                                        return pinchEnabled
+                                    }
+
+                                    override fun onScale(detector: ScaleGestureDetector): Boolean {
+                                        val range = controller.zoom.value
+                                        pinchRatio = (pinchRatio * detector.scaleFactor)
+                                            .coerceIn(range.minRatio, range.maxRatio)
+                                        controller.setZoomRatio(pinchRatio)
+                                        return true
+                                    }
+                                },
+                            )
+                            previewView.setOnTouchListener { view, event ->
+                                pinchDetector.onTouchEvent(event)
+                                if (event.actionMasked == MotionEvent.ACTION_DOWN) pinched = false
+                                if (event.pointerCount > 1 || pinchDetector.isInProgress) pinched = true
+                                if (event.actionMasked == MotionEvent.ACTION_UP && !pinched &&
+                                    view.width > 0 && view.height > 0
+                                ) {
+                                    view.performClick()
+                                    controller.tapToFocus(
+                                        xFraction = event.x / view.width,
+                                        yFraction = event.y / view.height,
+                                    )
+                                }
+                                true
                             }
-                            true
-                        }
-                        previewView.holder.addCallback(
-                            object : SurfaceHolder.Callback {
-                                override fun surfaceCreated(holder: SurfaceHolder) {
-                                    currentHolder = holder
-                                    currentDisplayRotation =
-                                        previewView.display?.rotation ?: Surface.ROTATION_0
-                                    currentViewWidth = previewView.width
-                                    currentViewHeight = previewView.height
-                                    if (currentViewWidth > 0 && currentViewHeight > 0 &&
+                            previewView.holder.addCallback(
+                                object : SurfaceHolder.Callback {
+                                    override fun surfaceCreated(holder: SurfaceHolder) {
+                                        // The preview goes through GL so the colour look shows live;
+                                        // without GL the camera draws straight into the view.
+                                        lookRenderer?.release()
+                                        lookRenderer = LookPreviewRenderer(holder.surface).takeIf { it.ready }
+                                            ?.also { renderer ->
+                                                renderer.setLook(previewLook)
+                                                controller.previewSurfaceProvider = renderer::cameraSurface
+                                            }
+                                        if (lookRenderer == null) controller.previewSurfaceProvider = null
+                                        currentHolder = holder
+                                        currentDisplayRotation =
+                                            previewView.display?.rotation ?: Surface.ROTATION_0
+                                        currentViewWidth = previewView.width
+                                        currentViewHeight = previewView.height
+                                        if (currentViewWidth > 0 && currentViewHeight > 0 &&
+                                            lifecycleOwner.lifecycle.currentState
+                                                .isAtLeast(Lifecycle.State.RESUMED)
+                                        ) {
+                                            controller.startPreview(
+                                                holder,
+                                                currentDisplayRotation,
+                                                currentViewWidth,
+                                                currentViewHeight,
+                                            )
+                                        }
+                                    }
+
+                                    override fun surfaceChanged(
+                                        holder: SurfaceHolder,
+                                        format: Int,
+                                        width: Int,
+                                        height: Int,
+                                    ) = Unit
+
+                                    override fun surfaceDestroyed(holder: SurfaceHolder) {
+                                        if (currentHolder === holder) {
+                                            currentHolder = null
+                                            controller.stopPreview()
+                                        }
+                                        controller.previewSurfaceProvider = null
+                                        lookRenderer?.release()
+                                        lookRenderer = null
+                                    }
+                                },
+                            )
+                            previewView.addOnLayoutChangeListener { view, left, top, right, bottom, _, _, _, _ ->
+                                val width = right - left
+                                val height = bottom - top
+                                if (width > 0 && height > 0) {
+                                    currentViewWidth = width
+                                    currentViewHeight = height
+                                    val holder = previewView.holder
+                                    if (holder.surface.isValid &&
                                         lifecycleOwner.lifecycle.currentState
                                             .isAtLeast(Lifecycle.State.RESUMED)
                                     ) {
                                         controller.startPreview(
                                             holder,
-                                            currentDisplayRotation,
-                                            currentViewWidth,
-                                            currentViewHeight,
+                                            view.display?.rotation ?: Surface.ROTATION_0,
+                                            width,
+                                            height,
                                         )
                                     }
                                 }
+                            }
+                            previewView
+                        },
+                    )
 
-                                override fun surfaceChanged(
-                                    holder: SurfaceHolder,
-                                    format: Int,
-                                    width: Int,
-                                    height: Int,
-                                ) = Unit
-
-                                override fun surfaceDestroyed(holder: SurfaceHolder) {
-                                    if (currentHolder === holder) {
-                                        currentHolder = null
-                                        controller.stopPreview()
-                                    }
-                                }
-                            },
+                    if (captureMode == CaptureMode.VIDEO) {
+                        // The recorder writes 16:9; show what it keeps.
+                        val portrait = viewfinderAspectRatio < 1f
+                        FrameMask(if (portrait) 9f / 16f else 16f / 9f, Modifier.fillMaxSize())
+                    }
+                    SwitchVeil(veilImage, veilVisible, Modifier.fillMaxSize())
+                    if (settings.gridLines) GridOverlay(Modifier.fillMaxSize())
+                    if (settings.histogram && streaming && dial == null && burstRun == null) {
+                        previewSurfaceView?.let { view ->
+                            HistogramOverlay(
+                                view = view,
+                                modifier = Modifier
+                                    .align(Alignment.BottomEnd)
+                                    .padding(12.dp),
+                            )
+                        }
+                    }
+                    val flashAlpha by animateFloatAsState(
+                        if (flashVisible) 0.75f else 0f,
+                        tween(if (flashVisible) 40 else 220),
+                        label = "shutterFlash",
+                    )
+                    if (flashAlpha > 0f) {
+                        Box(
+                            Modifier
+                                .fillMaxSize()
+                                .background(Color.Black.copy(alpha = flashAlpha)),
                         )
-                        previewView.addOnLayoutChangeListener { view, left, top, right, bottom, _, _, _, _ ->
-                            val width = right - left
-                            val height = bottom - top
-                            if (width > 0 && height > 0) {
-                                currentViewWidth = width
-                                currentViewHeight = height
-                                val holder = previewView.holder
-                                if (holder.surface.isValid &&
-                                    lifecycleOwner.lifecycle.currentState
-                                        .isAtLeast(Lifecycle.State.RESUMED)
-                                ) {
-                                    controller.startPreview(
-                                        holder,
-                                        view.display?.rotation ?: Surface.ROTATION_0,
-                                        width,
-                                        height,
+                    }
+                    AnimatedContent(
+                        targetState = timerRemaining,
+                        transitionSpec = {
+                            (fadeIn(tween(160)) + scaleIn(tween(220), initialScale = 1.4f)) togetherWith
+                                (fadeOut(tween(160)) + scaleOut(tween(220), targetScale = 0.7f))
+                        },
+                        modifier = Modifier.align(Alignment.Center),
+                        label = "selfTimer",
+                    ) { seconds ->
+                        if (seconds != null) {
+                            Text(
+                                text = seconds.toString(),
+                                color = FabulaColors.Text,
+                                fontSize = 96.sp,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                        }
+                    }
+                    if (continuousShots >= 0) {
+                        OverlayChip(
+                            text = "${latestDrive.short} · $continuousShots",
+                            color = FabulaColors.Accent,
+                            modifier = Modifier
+                                .align(Alignment.TopCenter)
+                                .padding(top = 12.dp),
+                        )
+                    }
+                    recording?.let {
+                        RecordingTimer(
+                            startedAtElapsedMs = it.startedAtElapsedMs,
+                            modifier = Modifier
+                                .align(Alignment.TopCenter)
+                                .padding(top = 12.dp),
+                        )
+                    }
+                    val overlay = when {
+                        burstRun != null -> BottomOverlay.BURST
+                        dial != null -> BottomOverlay.DIAL
+                        zoomAllowed && streaming -> BottomOverlay.ZOOM
+                        captureMode == CaptureMode.BURST && rawCaptureSize != null -> BottomOverlay.FRAMES
+                        else -> BottomOverlay.NONE
+                    }
+                    if (dial != null) lastDial = dial
+                    if (burstRun != null && !burstRun.finalizing) {
+                        Box(
+                            Modifier
+                                .fillMaxSize()
+                                .border(2.dp, FabulaColors.Accent),
+                        )
+                    }
+                    AnimatedContent(
+                        targetState = overlay,
+                        transitionSpec = {
+                            (fadeIn(tween(180)) + slideInVertically(tween(220)) { it / 3 }) togetherWith
+                                (fadeOut(tween(140)) + slideOutVertically(tween(180)) { it / 3 })
+                        },
+                        contentAlignment = Alignment.BottomCenter,
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .fillMaxWidth(),
+                        label = "viewfinderOverlay",
+                    ) { kind ->
+                        Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.BottomCenter) {
+                            when (kind) {
+                                BottomOverlay.BURST -> burstRun?.let { run ->
+                                    BurstProgressBar(
+                                        done = run.savedFrames,
+                                        total = run.totalFrames,
+                                        modifier = Modifier.padding(16.dp),
                                     )
                                 }
+                                BottomOverlay.DIAL -> lastDial?.let { shownDial ->
+                                    ProDial(
+                                        state = shownDial,
+                                        onIndexChange = { index ->
+                                            proControls.select(shownDial.param, index, controller, settingsStore::update)
+                                        },
+                                        onAutoChange = { auto -> proControls.setAuto(shownDial.param, auto, controller) },
+                                    )
+                                }
+                                BottomOverlay.ZOOM -> ZoomControl(
+                                    ratio = zoom.ratio,
+                                    minRatio = zoom.minRatio,
+                                    maxRatio = zoom.maxRatio,
+                                    onRatioChange = { ratio ->
+                                        zoomJob?.cancel()
+                                        controller.setZoomRatio(ratio)
+                                    },
+                                    onPresetSelected = ::glideZoom,
+                                    onUnavailable = ::showToast,
+                                    modifier = Modifier.padding(bottom = 16.dp),
+                                )
+                                BottomOverlay.FRAMES -> FrameCountPicker(
+                                    selected = settings.burstFrames,
+                                    onSelect = { count -> settingsStore.update { it.copy(burstFrames = count) } },
+                                    modifier = Modifier.padding(bottom = 16.dp),
+                                )
+                                BottomOverlay.NONE -> Unit
                             }
                         }
-                        previewView
-                    },
-                )
+                    }
+                }
 
                 focusTap?.let { tap ->
                     val markerSize = 64.dp
@@ -446,24 +888,21 @@ private fun CameraPreview() {
                             .size(markerSize)
                             .border(
                                 width = 2.dp,
-                                color = MaterialTheme.colorScheme.tertiary,
+                                color = FabulaColors.Accent,
                                 shape = CircleShape,
                             ),
                     )
                 }
 
-                Text(
-                    text = previewState.label(),
+                val statusMessage = if (!streaming) previewState.label() else toast
+                if (statusMessage != null) lastStatusMessage = statusMessage
+                StatusChip(
+                    visible = statusMessage != null,
+                    text = lastStatusMessage,
+                    error = previewState is CameraPreviewState.Error,
                     modifier = Modifier
                         .align(Alignment.TopCenter)
-                        .padding(top = 12.dp)
-                        .background(
-                            color = MaterialTheme.colorScheme.surface.copy(alpha = 0.82f),
-                            shape = RoundedCornerShape(12.dp),
-                        )
-                        .padding(horizontal = 12.dp, vertical = 8.dp),
-                    color = MaterialTheme.colorScheme.onSurface,
-                    style = MaterialTheme.typography.labelMedium,
+                        .padding(top = 12.dp, start = 16.dp, end = 16.dp),
                 )
 
                 if (previewState is CameraPreviewState.Error) {
@@ -486,186 +925,129 @@ private fun CameraPreview() {
                 }
             }
 
-            captureMessage?.let { message ->
-                Column(
-                    modifier = Modifier
-                        .padding(bottom = 8.dp)
-                        .background(
-                            color = MaterialTheme.colorScheme.surface.copy(alpha = 0.82f),
-                            shape = RoundedCornerShape(12.dp),
-                        )
-                        .padding(horizontal = 12.dp, vertical = 8.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                ) {
-                    Text(
-                        text = message,
-                        color = MaterialTheme.colorScheme.onSurface,
-                        style = MaterialTheme.typography.labelMedium,
-                    )
-                    if (savedSuperResolution != null || savedPreviewUri != null) {
-                        Row(horizontalArrangement = Arrangement.Center) {
-                            savedSuperResolution?.let { (uri, mimeType) ->
-                                TextButton(
-                                    onClick = {
-                                        outputOpenError = openSavedImage(context, uri, mimeType)
-                                    },
-                                ) { Text(if (mimeType == "image/jpeg") "Open 2× JPEG" else "Open 2× TIFF") }
-                            }
-                            savedPreviewUri?.let { uri ->
-                                TextButton(
-                                    onClick = {
-                                        outputOpenError = openSavedImage(context, uri, "image/jpeg")
-                                    },
-                                ) { Text("Open preview") }
-                            }
-                        }
-                    }
-                    outputOpenError?.let { error ->
-                        Text(
-                            text = error,
-                            color = MaterialTheme.colorScheme.error,
-                            style = MaterialTheme.typography.bodySmall,
-                        )
-                    }
-                }
-            }
-
-            val streamingState = previewState as? CameraPreviewState.Streaming
-            val rawCaptureSize = streamingState?.rawCaptureSize
-            val rawBurstCapturing = rawBurstState is RawBurstState.Capturing
-            val rawBurstStatus = when (val burst = rawBurstState) {
-                RawBurstState.Idle -> if (rawCaptureSize != null) {
-                    "RAW ${rawCaptureSize.width}×${rawCaptureSize.height} advertised"
-                } else {
-                    "RAW unavailable in this camera session"
-                }
-                is RawBurstState.Capturing -> if (burst.finalizing) {
-                    if (burst.savedFrames < burst.totalFrames) {
-                        "Processing RAW frames · ${burst.savedFrames}/${burst.totalFrames}"
-                    } else {
-                        "Reconstructing 2× TIFF + JPEG"
-                    }
-                } else {
-                    "RAW burst · ${burst.savedFrames}/${burst.totalFrames}"
-                }
-                is RawBurstState.Completed ->
-                    run {
-                        val outputs = buildList {
-                            if (burst.superResolutionWidth > 0 && burst.superResolutionHeight > 0) {
-                                val megapixels = (burst.superResolutionWidth.toLong() *
-                                    burst.superResolutionHeight + 500_000L) / 1_000_000L
-                                val formats = if (burst.superResolutionJpegUri != null) "TIFF + JPEG" else "TIFF"
-                                add("${megapixels} MP 2× $formats · ${burst.superResolutionFrames} frames")
-                            }
-                            if (burst.fusionPreviewSaved) add("preview")
-                        }
-                        "DNG files saved · ${burst.savedFrames}/${burst.totalFrames}" +
-                            (if (outputs.isNotEmpty()) " · ${outputs.joinToString(" + ")}" else "") +
-                            " — Pictures/Fabula/RAW_Burst_${burst.burstId}"
-                    }
-                is RawBurstState.Failed -> "RAW burst: ${burst.message}"
-            }
-
-            if (rawCaptureSize != null) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .horizontalScroll(rememberScrollState())
-                        .padding(horizontal = 16.dp),
-                    horizontalArrangement = Arrangement.Center,
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(
-                        text = "Frames",
-                        modifier = Modifier.padding(end = 8.dp),
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    listOf(8, 12, 15).forEach { count ->
-                        FilterChip(
-                            selected = rawBurstFrameCount == count,
-                            enabled = !rawBurstCapturing,
-                            onClick = { rawBurstFrameCount = count },
-                            label = { Text(count.toString()) },
-                            modifier = Modifier.padding(end = 8.dp),
-                        )
-                    }
-                }
-            }
-
-            FilledTonalButton(
-                modifier = Modifier
-                    .padding(horizontal = 20.dp)
-                    .fillMaxWidth(),
-                enabled = rawCaptureSize != null &&
-                    !rawBurstCapturing,
-                onClick = { controller.captureRawBurst(frameCount = rawBurstFrameCount) },
-            ) {
-                val label = (rawBurstState as? RawBurstState.Capturing)?.let {
-                    if (it.finalizing) {
-                        "Reconstructing 2× TIFF…"
-                    } else {
-                        "RAW burst · ${it.savedFrames}/${it.totalFrames}"
-                    }
-                } ?: "Capture $rawBurstFrameCount RAW frames"
-                Text(label)
-            }
-            Text(
-                text = rawBurstStatus,
-                modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            if (rawCaptureSize != null) {
-                Text(
-                    text = "Every DNG is kept; the TIFF uses frames with reliable alignment.",
-                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 2.dp),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-
-            Row(
+            Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 20.dp, vertical = 12.dp),
-                horizontalArrangement = Arrangement.SpaceEvenly,
-                verticalAlignment = Alignment.CenterVertically,
+                    .padding(horizontal = 28.dp, vertical = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp),
             ) {
-                FilledTonalButton(
-                    modifier = Modifier.size(56.dp),
-                    shape = CircleShape,
-                    contentPadding = PaddingValues(0.dp),
-                    enabled = previewState is CameraPreviewState.Streaming && !rawBurstCapturing,
-                    onClick = { showExposureControls = true },
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Text("EV")
+                    RoundControl(
+                        description = "Pro controls",
+                        enabled = streaming && !burstBusy,
+                        active = dial != null,
+                        outlined = true,
+                        onClick = {
+                            activeParam = if (dial != null) null else ProParam.ISO
+                        },
+                    ) { tint -> DialIcon(tint) }
+                    if (captureMode == CaptureMode.VIDEO) {
+                        RecordButton(
+                            enabled = streaming && !burstBusy && videoState != VideoRecordingState.Starting,
+                            recording = recording != null,
+                            onClick = {
+                                activeParam = null
+                                toggleRecording()
+                            },
+                        )
+                    } else ShutterButton(
+                        mode = captureMode,
+                        enabled = streaming && !burstBusy,
+                        capturing = burstRun != null && !burstRun.finalizing,
+                        processing = burstRun?.finalizing == true,
+                        progress = burstRun?.let { it.savedFrames.toFloat() / it.totalFrames.coerceAtLeast(1) } ?: 0f,
+                        onClick = { onShutterTap() },
+                        onHoldStart = if (captureMode == CaptureMode.PHOTO && drive.intervalMs > 0) {
+                            {
+                                activeParam = null
+                                continuousHideJob?.cancel()
+                                continuousShots = 0
+                                controller.startContinuousCapture(latestDrive.intervalMs)
+                            }
+                        } else {
+                            null
+                        },
+                        onHoldEnd = {
+                            controller.stopContinuousCapture()
+                            // Keep the count on screen a moment, then clear it.
+                            continuousHideJob = screenScope.launch {
+                                delay(900)
+                                continuousShots = -1
+                            }
+                        },
+                    )
+                    RoundControl(
+                        description = "Settings",
+                        enabled = true,
+                        active = false,
+                        onClick = { showSettings = true },
+                    ) { tint -> DotsIcon(tint) }
                 }
-
-                Button(
-                    modifier = Modifier
-                        .size(72.dp)
-                        .semantics { contentDescription = "Take a photo" },
-                    enabled = previewState is CameraPreviewState.Streaming && !rawBurstCapturing,
-                    shape = CircleShape,
-                    contentPadding = PaddingValues(0.dp),
-                    onClick = controller::captureJpeg,
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Text("●", fontSize = 24.sp)
-                }
-
-                FilledTonalButton(
-                    modifier = Modifier.size(56.dp),
-                    shape = CircleShape,
-                    contentPadding = PaddingValues(0.dp),
-                    onClick = {
-                        showDiagnostics = true
-                        diagnosticsViewModel.refresh()
-                    },
-                ) {
-                    Text("i")
+                    LastCaptureThumbnail(
+                        uri = lastCaptureUri ?: latestGalleryUri,
+                        highlighted = false,
+                        onOpen = { showGallery = true },
+                    )
+                    ModeSwitch(
+                        mode = captureMode,
+                        unsupported = unsupportedModes,
+                        enabled = !burstBusy && videoState == VideoRecordingState.Idle,
+                        onModeChange = { mode -> settingsStore.update { it.copy(captureMode = mode.name) } },
+                        onUnavailable = ::showToast,
+                    )
+                    RoundControl(
+                        description = "Lock exposure",
+                        enabled = streaming && !burstBusy && exposureControls.autoExposureLockAvailable &&
+                            exposureControls.mode == CameraExposureMode.AUTO,
+                        active = exposureControls.autoExposureLocked,
+                        onClick = { controller.setAutoExposureLock(!exposureControls.autoExposureLocked) },
+                    ) { tint ->
+                        Text("AEL", color = tint, fontSize = 12.sp, fontWeight = FontWeight.Bold, letterSpacing = 0.8.sp)
+                    }
                 }
             }
+        }
+
+        BackHandler(enabled = showGallery) { showGallery = false }
+        AnimatedVisibility(
+            visible = showGallery,
+            enter = ScreenEnter,
+            exit = ScreenExit,
+            label = "gallery",
+        ) {
+            GalleryScreen(
+                refreshKey = galleryVersion,
+                onOpen = { item -> openSavedImage(context, item.uri, item.mimeType)?.let(::showToast) },
+                onBack = { showGallery = false },
+            )
+        }
+
+        BackHandler(enabled = showSettings) { showSettings = false }
+        AnimatedVisibility(
+            visible = showSettings,
+            enter = ScreenEnter,
+            exit = ScreenExit,
+            label = "settings",
+        ) {
+            SettingsScreen(
+                settings = settings,
+                onChange = settingsStore::update,
+                onDiagnostics = {
+                    showDiagnostics = true
+                    diagnosticsViewModel.refresh()
+                },
+                onBack = { showSettings = false },
+                rawSupported = !streaming || rawCaptureSize != null,
+            )
         }
 
         if (showDiagnostics) {
@@ -1320,6 +1702,50 @@ private fun openSavedImage(context: Context, uri: Uri, mimeType: String): String
 } catch (exception: SecurityException) {
     "Could not grant access to the saved image: ${exception.message ?: "permission denied"}"
 }
+
+/** A pending MP4 entry in Movies/Fabula and a read-write descriptor the recorder can seek in. */
+private fun createVideoEntry(context: Context): Pair<Uri, ParcelFileDescriptor> {
+    val values = ContentValues().apply {
+        put(MediaStore.MediaColumns.DISPLAY_NAME, "Fabula_${System.currentTimeMillis()}.mp4")
+        put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4")
+        put(MediaStore.MediaColumns.RELATIVE_PATH, "${Environment.DIRECTORY_MOVIES}/Fabula")
+        put(MediaStore.MediaColumns.IS_PENDING, 1)
+    }
+    val resolver = context.contentResolver
+    val uri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
+        ?: throw IOException("MediaStore could not create the video entry.")
+    val descriptor = try {
+        resolver.openFileDescriptor(uri, "rw") ?: throw IOException("Could not open the video file.")
+    } catch (exception: Exception) {
+        resolver.delete(uri, null, null)
+        throw exception
+    }
+    return uri to descriptor
+}
+
+private suspend fun publishMediaEntry(context: Context, uri: Uri): Boolean = withContext(Dispatchers.IO) {
+    val values = ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
+    runCatching { context.contentResolver.update(uri, values, null, null) > 0 }.getOrDefault(false)
+}
+
+private enum class BottomOverlay { NONE, BURST, DIAL, ZOOM, FRAMES }
+
+/** Status and toast messages fade in from the top and fade out once cleared. */
+@Composable
+private fun StatusChip(visible: Boolean, text: String, error: Boolean, modifier: Modifier = Modifier) {
+    AnimatedVisibility(
+        visible = visible,
+        enter = fadeIn(tween(160)) + slideInVertically(tween(200)) { -it / 2 },
+        exit = fadeOut(tween(220)),
+        modifier = modifier,
+        label = "statusChip",
+    ) {
+        OverlayChip(text = text, color = if (error) FabulaColors.Error else FabulaColors.Text)
+    }
+}
+
+private val ScreenEnter = slideInHorizontally(tween(260)) { it / 4 } + fadeIn(tween(200))
+private val ScreenExit = slideOutHorizontally(tween(220)) { it / 4 } + fadeOut(tween(180))
 
 private fun openAppSettings(context: Context) {
     val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)

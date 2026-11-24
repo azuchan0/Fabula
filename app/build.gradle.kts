@@ -36,7 +36,7 @@ android {
         compose = true
     }
 
-    // Keep the generated NDK sample buildable until the native code is moved to its module.
+    // Native RAW alignment, 2x reconstruction, JPEG encoding and colour looks (src/main/cpp).
     externalNativeBuild {
         cmake {
             path = file("src/main/cpp/CMakeLists.txt")
@@ -59,7 +59,6 @@ dependencies {
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.lifecycle.runtime.compose)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
-    // Retained for the unused Android Studio starter XML layout until it is cleaned up later.
     implementation(libs.androidx.compose.ui)
     implementation(libs.androidx.compose.ui.graphics)
     implementation(libs.androidx.compose.ui.tooling.preview)

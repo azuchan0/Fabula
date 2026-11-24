@@ -150,6 +150,30 @@ class NativeRawBurstAlignerTest {
     }
 
     @Test
+    fun fusesFeaturelessFramesOnlyWithASensorNoiseModel() {
+        val noiseModel = doubleArrayOf(1.0e-4, 1.0e-6)
+        val withModel = NativeRawBurstAligner(superResolutionEnabled = false)
+        val withoutModel = NativeRawBurstAligner(superResolutionEnabled = false)
+        try {
+            repeat(2) {
+                withModel.addBuffer(
+                    rawFrame(shiftX = 0, shiftY = 0, uniform = true), WIDTH, HEIGHT, ROW_STRIDE, 2,
+                    noiseModel = noiseModel,
+                )
+                withoutModel.addBuffer(rawFrame(shiftX = 0, shiftY = 0, uniform = true), WIDTH, HEIGHT, ROW_STRIDE, 2)
+            }
+
+            // Nothing to align on: with a noise model the frame is fused as static (it matches
+            // the reference within noise); without one it is dropped as before.
+            assertEquals(2, requireNotNull(withModel.finishFusionPreview()).contributingFrames)
+            assertEquals(1, requireNotNull(withoutModel.finishFusionPreview()).contributingFrames)
+        } finally {
+            withModel.close()
+            withoutModel.close()
+        }
+    }
+
+    @Test
     fun keepsReducedPreviewWhenDiskBackedReconstructionIsUnavailable() {
         val outputFile = File.createTempFile("fabula-no-space-", ".tiff")
         val aligner = NativeRawBurstAligner(superResolutionEnabled = false)

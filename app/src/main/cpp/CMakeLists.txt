@@ -39,4 +39,5 @@ target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE -O3 -fno-math-errno)
 target_link_libraries(${CMAKE_PROJECT_NAME}
         # List libraries link to the target library
         android
+        jnigraphics
         log)

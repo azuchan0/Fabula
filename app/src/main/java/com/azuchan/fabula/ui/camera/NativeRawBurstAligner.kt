@@ -65,6 +65,12 @@ class NativeRawBurstAligner(superResolutionEnabled: Boolean) : Closeable {
         check(nativeHandle != 0L) { "Could not create the native RAW burst aligner." }
     }
 
+    /** Colour look applied to the 2x output (matrix on display RGB, then per-channel curves). */
+    fun setLook(tables: LookTables) {
+        check(nativeHandle != 0L) { "The native RAW burst aligner is closed." }
+        nativeSetLook(nativeHandle, tables.matrix, tables.curves)
+    }
+
     fun addFrame(
         frame: RawFrameData,
         cfaChannels: IntArray,
@@ -72,6 +78,7 @@ class NativeRawBurstAligner(superResolutionEnabled: Boolean) : Closeable {
         whiteLevel: Double,
         colorGains: DoubleArray,
         colorMatrix: DoubleArray = doubleArrayOf(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0),
+        noiseModel: DoubleArray? = null,
     ): RawFrameAlignment {
         check(nativeHandle != 0L) { "The native RAW burst aligner is closed." }
         return addBuffer(
@@ -86,6 +93,7 @@ class NativeRawBurstAligner(superResolutionEnabled: Boolean) : Closeable {
             colorGains = colorGains,
             colorMatrix = colorMatrix,
             spoolPath = frame.spoolFile?.absolutePath,
+            noiseModel = noiseModel,
         )
     }
 
@@ -101,6 +109,7 @@ class NativeRawBurstAligner(superResolutionEnabled: Boolean) : Closeable {
         colorGains: DoubleArray = doubleArrayOf(1.0, 1.0, 1.0),
         colorMatrix: DoubleArray = doubleArrayOf(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0),
         spoolPath: String? = null,
+        noiseModel: DoubleArray? = null,
     ): RawFrameAlignment {
         check(nativeHandle != 0L) { "The native RAW burst aligner is closed." }
         require(buffer.isDirect) {
@@ -112,6 +121,9 @@ class NativeRawBurstAligner(superResolutionEnabled: Boolean) : Closeable {
             colorMatrix.size == COLOR_MATRIX_LENGTH
         ) {
             "RAW color metadata has invalid dimensions."
+        }
+        require(noiseModel == null || noiseModel.size == NOISE_MODEL_LENGTH) {
+            "The sensor noise model must hold a scale and an offset."
         }
 
         val values = nativeAddFrame(
@@ -127,6 +139,7 @@ class NativeRawBurstAligner(superResolutionEnabled: Boolean) : Closeable {
             colorGains = colorGains,
             colorMatrix = colorMatrix,
             spoolPath = spoolPath,
+            noiseModel = noiseModel,
         )
         check(values.size == RESULT_LENGTH) {
             "The native RAW burst aligner returned an invalid result."
@@ -197,12 +210,14 @@ class NativeRawBurstAligner(superResolutionEnabled: Boolean) : Closeable {
         )
     }
 
+    /** Either descriptor may be null (TIFF-only or JPEG-only), not both. */
     fun writeSuperResolution(
-        tiffDescriptor: ParcelFileDescriptor,
+        tiffDescriptor: ParcelFileDescriptor?,
         jpegDescriptor: ParcelFileDescriptor?,
         orientationDegrees: Int,
     ): RawFusionTiff? {
         check(nativeHandle != 0L) { "The native RAW burst aligner is closed." }
+        require(tiffDescriptor != null || jpegDescriptor != null) { "No output for the 2x reconstruction." }
         if (previewWidth == 0 || previewHeight == 0) return null
         val dimensions = nativeWriteSuperResolutionToDescriptors(
             handle = nativeHandle,
@@ -229,6 +244,9 @@ class NativeRawBurstAligner(superResolutionEnabled: Boolean) : Closeable {
     private external fun createAligner(superResolutionEnabled: Boolean): Long
 
     @Keep
+    private external fun nativeSetLook(handle: Long, matrix: FloatArray, curves: ByteArray)
+
+    @Keep
     private external fun nativeAddFrame(
         handle: Long,
         buffer: ByteBuffer,
@@ -242,6 +260,7 @@ class NativeRawBurstAligner(superResolutionEnabled: Boolean) : Closeable {
         colorGains: DoubleArray,
         colorMatrix: DoubleArray,
         spoolPath: String?,
+        noiseModel: DoubleArray?,
     ): DoubleArray
 
     @Keep
@@ -258,7 +277,7 @@ class NativeRawBurstAligner(superResolutionEnabled: Boolean) : Closeable {
     @Keep
     private external fun nativeWriteSuperResolutionToDescriptors(
         handle: Long,
-        tiffDescriptor: ParcelFileDescriptor,
+        tiffDescriptor: ParcelFileDescriptor?,
         jpegDescriptor: ParcelFileDescriptor?,
         orientation: Int,
     ): IntArray
@@ -267,6 +286,7 @@ class NativeRawBurstAligner(superResolutionEnabled: Boolean) : Closeable {
 
     private companion object {
         const val RESULT_HEADER_LENGTH = 10
+        const val NOISE_MODEL_LENGTH = 2
         const val LOCAL_GRID_COLUMNS = 5
         const val LOCAL_GRID_ROWS = 4
         const val LOCAL_REGION_COUNT = LOCAL_GRID_COLUMNS * LOCAL_GRID_ROWS
