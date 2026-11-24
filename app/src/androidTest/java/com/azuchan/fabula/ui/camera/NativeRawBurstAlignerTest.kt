@@ -17,10 +17,9 @@ import org.junit.runner.RunWith
 class NativeRawBurstAlignerTest {
     @Test
     fun estimatesTranslationForTexturedFrames() {
-        val scratchFile = File.createTempFile("fabula-aligner-test-", ".accum")
         val outputFile = File.createTempFile("fabula-aligner-test-", ".tiff")
         val directOutputFile = File.createTempFile("fabula-aligner-stream-test-", ".tiff")
-        val aligner = NativeRawBurstAligner(scratchFile)
+        val aligner = NativeRawBurstAligner(superResolutionEnabled = true)
         try {
             val reference = aligner.addBuffer(rawFrame(shiftX = 0, shiftY = 0), WIDTH, HEIGHT, ROW_STRIDE, 2)
             val shifted = aligner.addBuffer(rawFrame(shiftX = 8, shiftY = -12), WIDTH, HEIGHT, ROW_STRIDE, 2)
@@ -49,7 +48,7 @@ class NativeRawBurstAlignerTest {
             assertEquals(2, preview.contributingFrames)
             assertTrue(preview.argbData.drop(preview.pixelOffset).any { (it and 0x00ffffff) != 0 })
 
-            val tiff = requireNotNull(aligner.writeSuperResolutionTiff(outputFile, 90))
+            val tiff = requireNotNull(aligner.writeSuperResolution(outputFile, null, 90))
             assertEquals(WIDTH * 2, tiff.width)
             assertEquals(HEIGHT * 2, tiff.height)
             assertEquals(2, tiff.contributingFrames)
@@ -103,7 +102,7 @@ class NativeRawBurstAlignerTest {
                 ParcelFileDescriptor.MODE_READ_WRITE or ParcelFileDescriptor.MODE_TRUNCATE,
             )
             val streamedTiff = requireNotNull(
-                descriptor.use { aligner.writeSuperResolutionTiff(it, 180) },
+                descriptor.use { aligner.writeSuperResolution(it, null, 180) },
             )
             assertEquals(tiff.width, streamedTiff.width)
             assertEquals(tiff.height, streamedTiff.height)
@@ -121,7 +120,6 @@ class NativeRawBurstAlignerTest {
             assertEquals(3, streamedOrientation)
         } finally {
             aligner.close()
-            scratchFile.delete()
             outputFile.delete()
             directOutputFile.delete()
         }
@@ -129,8 +127,7 @@ class NativeRawBurstAlignerTest {
 
     @Test
     fun marksUniformFramesAsLowConfidence() {
-        val scratchFile = File.createTempFile("fabula-aligner-test-", ".accum")
-        val aligner = NativeRawBurstAligner(scratchFile)
+        val aligner = NativeRawBurstAligner(superResolutionEnabled = true)
         try {
             aligner.addBuffer(rawFrame(shiftX = 0, shiftY = 0, uniform = true), WIDTH, HEIGHT, ROW_STRIDE, 2)
             val repeated = aligner.addBuffer(
@@ -149,19 +146,18 @@ class NativeRawBurstAlignerTest {
             assertTrue(repeated.localRegions.none { it.reliable })
         } finally {
             aligner.close()
-            scratchFile.delete()
         }
     }
 
     @Test
     fun keepsReducedPreviewWhenDiskBackedReconstructionIsUnavailable() {
         val outputFile = File.createTempFile("fabula-no-space-", ".tiff")
-        val aligner = NativeRawBurstAligner(scratchFile = null)
+        val aligner = NativeRawBurstAligner(superResolutionEnabled = false)
         try {
             aligner.addBuffer(rawFrame(shiftX = 0, shiftY = 0), WIDTH, HEIGHT, ROW_STRIDE, 2)
 
             assertEquals(1, requireNotNull(aligner.finishFusionPreview()).contributingFrames)
-            assertEquals(null, aligner.writeSuperResolutionTiff(outputFile, 0))
+            assertEquals(null, aligner.writeSuperResolution(outputFile, null, 0))
         } finally {
             aligner.close()
             outputFile.delete()
@@ -170,13 +166,12 @@ class NativeRawBurstAlignerTest {
 
     @Test
     fun reconstructsFlatFieldWithoutBanding() {
-        val scratchFile = File.createTempFile("fabula-aligner-flat-", ".accum")
         val outputFile = File.createTempFile("fabula-aligner-flat-", ".tiff")
-        val aligner = NativeRawBurstAligner(scratchFile)
+        val aligner = NativeRawBurstAligner(superResolutionEnabled = true)
         try {
             aligner.addBuffer(rawFrame(shiftX = 0, shiftY = 0, uniform = true), WIDTH, HEIGHT, ROW_STRIDE, 2)
             aligner.addBuffer(rawFrame(shiftX = 0, shiftY = 0, uniform = true), WIDTH, HEIGHT, ROW_STRIDE, 2)
-            val tiff = requireNotNull(aligner.writeSuperResolutionTiff(outputFile, 0))
+            val tiff = requireNotNull(aligner.writeSuperResolution(outputFile, null, 0))
             val pixels = readTiffRegion(outputFile, tiff.width, x = 8, y = 8, size = tiff.width - 16)
             val values = pixels.map { it.toInt() and 0xff }
             val spread = values.max() - values.min()
@@ -184,19 +179,16 @@ class NativeRawBurstAlignerTest {
             assertTrue(values.first() > 0)
         } finally {
             aligner.close()
-            scratchFile.delete()
             outputFile.delete()
         }
     }
 
     @Test
     fun rejectsMovingObjectAgainstReference() {
-        val staticScratch = File.createTempFile("fabula-aligner-static-", ".accum")
-        val movingScratch = File.createTempFile("fabula-aligner-moving-", ".accum")
         val staticOutput = File.createTempFile("fabula-aligner-static-", ".tiff")
         val movingOutput = File.createTempFile("fabula-aligner-moving-", ".tiff")
-        val staticAligner = NativeRawBurstAligner(staticScratch)
-        val movingAligner = NativeRawBurstAligner(movingScratch)
+        val staticAligner = NativeRawBurstAligner(superResolutionEnabled = true)
+        val movingAligner = NativeRawBurstAligner(superResolutionEnabled = true)
         try {
             val reference = rawFrame(shiftX = 0, shiftY = 0)
             staticAligner.addBuffer(reference, WIDTH, HEIGHT, ROW_STRIDE, 2)
@@ -208,8 +200,8 @@ class NativeRawBurstAlignerTest {
             }
             movingAligner.addBuffer(moving, WIDTH, HEIGHT, ROW_STRIDE, 2)
 
-            val staticTiff = requireNotNull(staticAligner.writeSuperResolutionTiff(staticOutput, 0))
-            val movingTiff = requireNotNull(movingAligner.writeSuperResolutionTiff(movingOutput, 0))
+            val staticTiff = requireNotNull(staticAligner.writeSuperResolution(staticOutput, null, 0))
+            val movingTiff = requireNotNull(movingAligner.writeSuperResolution(movingOutput, null, 0))
             val expected = readTiffRegion(staticOutput, staticTiff.width, x = 900, y = 900, size = 200)
             val actual = readTiffRegion(movingOutput, movingTiff.width, x = 900, y = 900, size = 200)
             val meanDifference = expected.indices.sumOf {
@@ -219,8 +211,6 @@ class NativeRawBurstAlignerTest {
         } finally {
             staticAligner.close()
             movingAligner.close()
-            staticScratch.delete()
-            movingScratch.delete()
             staticOutput.delete()
             movingOutput.delete()
         }
@@ -228,7 +218,7 @@ class NativeRawBurstAlignerTest {
 
     @Test
     fun alignsNoisyLowLightBurst() {
-        val aligner = NativeRawBurstAligner(scratchFile = null)
+        val aligner = NativeRawBurstAligner(superResolutionEnabled = false)
         val shifts = listOf(0 to 0, 3 to -2, -5 to 4, 7 to 1, -2 to -6, 1 to 5, -4 to -1, 6 to -3)
         val report = StringBuilder()
         try {
@@ -263,6 +253,100 @@ class NativeRawBurstAlignerTest {
         } finally {
             aligner.close()
         }
+    }
+
+    @Test
+    fun writesDecodableJpegMatchingTheTiff() {
+        val tiffFile = File.createTempFile("fabula-aligner-jpeg-", ".tiff")
+        val jpegFile = File.createTempFile("fabula-aligner-jpeg-", ".jpg")
+        val aligner = NativeRawBurstAligner(superResolutionEnabled = true)
+        try {
+            aligner.addBuffer(smoothFrame(0.0, 0.0), WIDTH, HEIGHT, ROW_STRIDE, 2)
+            aligner.addBuffer(smoothFrame(1.5, -0.5), WIDTH, HEIGHT, ROW_STRIDE, 2)
+            val result = requireNotNull(aligner.writeSuperResolution(tiffFile, jpegFile, 90))
+            assertEquals(2, result.contributingFrames)
+
+            val bitmap = requireNotNull(android.graphics.BitmapFactory.decodeFile(jpegFile.absolutePath)) {
+                "Android could not decode the 2x JPEG (${jpegFile.length()} bytes)."
+            }
+            assertEquals(result.width, bitmap.width)
+            assertEquals(result.height, bitmap.height)
+            assertEquals(
+                android.media.ExifInterface.ORIENTATION_ROTATE_90,
+                android.media.ExifInterface(jpegFile.absolutePath).getAttributeInt(
+                    android.media.ExifInterface.TAG_ORIENTATION,
+                    android.media.ExifInterface.ORIENTATION_UNDEFINED,
+                ),
+            )
+            // The JPEG must be a faithful lossy copy of the TIFF pixels.
+            val size = 256
+            val x0 = 900
+            val y0 = 700
+            val tiffPixels = readTiffRegion(tiffFile, result.width, x = x0, y = y0, size = size)
+            var totalError = 0L
+            for (row in 0 until size) {
+                for (column in 0 until size) {
+                    val argb = bitmap.getPixel(x0 + column, y0 + row)
+                    val offset = (row * size + column) * 3
+                    totalError += kotlin.math.abs(((argb shr 16) and 0xff) - (tiffPixels[offset].toInt() and 0xff))
+                    totalError += kotlin.math.abs(((argb shr 8) and 0xff) - (tiffPixels[offset + 1].toInt() and 0xff))
+                    totalError += kotlin.math.abs((argb and 0xff) - (tiffPixels[offset + 2].toInt() and 0xff))
+                }
+            }
+            val meanError = totalError.toDouble() / (size * size * 3)
+            assertTrue("JPEG differs from the TIFF by $meanError on average", meanError < 3.0)
+            bitmap.recycle()
+        } finally {
+            aligner.close()
+            tiffFile.delete()
+            jpegFile.delete()
+        }
+    }
+
+    @Test
+    fun recoversNegativeSubpixelShifts() {
+        val aligner = NativeRawBurstAligner(superResolutionEnabled = false)
+        // Content shifted by +s needs a correction of -s; negative corrections used to lose their
+        // sub-pixel part in the fine refinement.
+        val shifts = listOf(1.5 to 2.5, -2.5 to 1.5, 3.25 to -0.75)
+        val report = StringBuilder()
+        try {
+            aligner.addBuffer(smoothFrame(0.0, 0.0), WIDTH, HEIGHT, ROW_STRIDE, 2)
+            var worstError = 0.0
+            shifts.forEach { (shiftX, shiftY) ->
+                val alignment = aligner.addBuffer(smoothFrame(shiftX, shiftY), WIDTH, HEIGHT, ROW_STRIDE, 2)
+                val error = maxOf(
+                    kotlin.math.abs(alignment.xCorrectionPixels + shiftX),
+                    kotlin.math.abs(alignment.yCorrectionPixels + shiftY),
+                )
+                worstError = maxOf(worstError, error)
+                report.append(
+                    "shift ($shiftX, $shiftY): correction " +
+                        "(${"%.2f".format(alignment.xCorrectionPixels)}, " +
+                        "${"%.2f".format(alignment.yCorrectionPixels)}) conf=${"%.3f".format(alignment.confidence)}\n",
+                )
+            }
+            assertTrue("Sub-pixel alignment too coarse:\n$report", worstError <= 0.3)
+        } finally {
+            aligner.close()
+        }
+    }
+
+    // Band-limited texture sampled at a continuous offset, so sub-pixel shifts are exact.
+    private fun smoothFrame(shiftX: Double, shiftY: Double): ByteBuffer {
+        val buffer = ByteBuffer.allocateDirect(ROW_STRIDE * HEIGHT).order(ByteOrder.LITTLE_ENDIAN)
+        for (y in 0 until HEIGHT) {
+            for (x in 0 until WIDTH) {
+                val sourceX = x - shiftX
+                val sourceY = y - shiftY
+                var value = 4000.0
+                for (wave in smoothWaves) {
+                    value += wave[0] * kotlin.math.sin(wave[1] * sourceX + wave[2] * sourceY + wave[3])
+                }
+                buffer.putShort((y * ROW_STRIDE) + x * 2, value.roundToInt().coerceIn(0, 16383).toShort())
+            }
+        }
+        return buffer
     }
 
     // Very dark scene: a few DN of large-scale texture above black, buried in shot and read noise.
@@ -332,6 +416,20 @@ class NativeRawBurstAlignerTest {
         const val DARK_CELLS = 160
         val darkTexture: IntArray = java.util.Random(42).let { random ->
             IntArray(DARK_CELLS * DARK_CELLS) { random.nextInt(4) }
+        }
+        // Amplitude, x and y angular frequencies (periods of roughly 12-60 px), and phase.
+        val smoothWaves: List<DoubleArray> = java.util.Random(7).let { random ->
+            List(12) {
+                val period = 12.0 + random.nextDouble() * 48.0
+                val angle = random.nextDouble() * Math.PI
+                val frequency = 2.0 * Math.PI / period
+                doubleArrayOf(
+                    150.0 + random.nextDouble() * 250.0,
+                    frequency * kotlin.math.cos(angle),
+                    frequency * kotlin.math.sin(angle),
+                    random.nextDouble() * 2.0 * Math.PI,
+                )
+            }
         }
         const val WIDTH = 1024
         const val HEIGHT = 1024

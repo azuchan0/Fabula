@@ -1,8 +1,7 @@
 package com.azuchan.fabula.ui.camera
 
-import android.graphics.ImageFormat
-import android.media.Image
 import androidx.annotation.Keep
+import com.azuchan.fabula.camera.RawFrameData
 import java.nio.ByteBuffer
 
 data class RawFrameStats(
@@ -16,7 +15,7 @@ data class RawFrameStats(
         get() = if (sampledPixelCount == 0L) 0.0 else sumOfSamples.toDouble() / sampledPixelCount
 }
 
-/** Reads a sparse sample of a Camera2 RAW_SENSOR plane in native code without copying its pixels. */
+/** Reads a sparse sample of a RAW_SENSOR frame in native code without copying its pixels. */
 @Keep
 object NativeRawFrameAnalyzer {
     private const val SAMPLE_STEP = 8
@@ -26,23 +25,18 @@ object NativeRawFrameAnalyzer {
         System.loadLibrary("fabula")
     }
 
-    fun analyze(image: Image): RawFrameStats {
-        require(image.format == ImageFormat.RAW_SENSOR) {
-            "The native analyzer expects a RAW_SENSOR image."
-        }
-        val plane = image.planes.firstOrNull()
-            ?: throw IllegalArgumentException("The RAW_SENSOR image has no plane.")
-        val buffer = plane.buffer
+    fun analyze(frame: RawFrameData): RawFrameStats {
+        val buffer = frame.buffer
         require(buffer.isDirect) {
-            "The RAW_SENSOR plane is not backed by a direct buffer."
+            "The RAW frame is not backed by a direct buffer."
         }
 
         val values = analyzeRawBuffer(
-            buffer = buffer.slice(),
-            width = image.width,
-            height = image.height,
-            rowStride = plane.rowStride,
-            pixelStride = plane.pixelStride,
+            buffer = buffer.duplicate().apply { position(0) }.slice(),
+            width = frame.width,
+            height = frame.height,
+            rowStride = frame.rowStride,
+            pixelStride = frame.pixelStride,
             sampleStep = SAMPLE_STEP,
         )
         check(values.size == RESULT_LENGTH) {

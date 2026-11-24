@@ -31,6 +31,11 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
 # Specifies libraries CMake should link to your target library. You
 # can link libraries from various origins, such as libraries defined in this
 # build script, prebuilt third-party libraries, or Android system libraries.
+# The burst pipeline is unusably slow at -O0, so optimize the native code in every build type
+# (debug APKs are used for device testing). Keep IEEE semantics: no -ffast-math, since the code
+# relies on std::isfinite and infinity sentinels.
+target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE -O3 -fno-math-errno)
+
 target_link_libraries(${CMAKE_PROJECT_NAME}
         # List libraries link to the target library
         android

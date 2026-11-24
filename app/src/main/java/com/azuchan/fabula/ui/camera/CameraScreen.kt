@@ -67,7 +67,6 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -218,21 +217,19 @@ private fun CameraPreview() {
     var currentViewHeight by remember { mutableIntStateOf(0) }
     var rawBurstFrameCount by remember { mutableIntStateOf(8) }
     var captureMessage by remember { mutableStateOf<String?>(null) }
-    var savedTiffUri by remember { mutableStateOf<Uri?>(null) }
+    // The 2x JPEG opens in any gallery; Android has no TIFF decoder, so the TIFF is only offered
+    // when the JPEG could not be written.
+    var savedSuperResolution by remember { mutableStateOf<Pair<Uri, String>?>(null) }
     var savedPreviewUri by remember { mutableStateOf<Uri?>(null) }
     var outputOpenError by remember { mutableStateOf<String?>(null) }
     var showDiagnostics by remember { mutableStateOf(false) }
     var showExposureControls by remember { mutableStateOf(false) }
-    val latestHolder = rememberUpdatedState(currentHolder)
-    val latestDisplayRotation = rememberUpdatedState(currentDisplayRotation)
-    val latestViewWidth = rememberUpdatedState(currentViewWidth)
-    val latestViewHeight = rememberUpdatedState(currentViewHeight)
 
     LaunchedEffect(controller) {
         controller.captureEvents.collect { event ->
             when (event) {
                 is CameraCaptureEvent.JpegReady -> {
-                    savedTiffUri = null
+                    savedSuperResolution = null
                     savedPreviewUri = null
                     outputOpenError = null
                     captureMessage = "Saving photo…"
@@ -250,21 +247,23 @@ private fun CameraPreview() {
 
                 is CameraCaptureEvent.RawBurstProgress -> {
                     if (event.savedFrames == 0) {
-                        savedTiffUri = null
+                        savedSuperResolution = null
                         savedPreviewUri = null
                         outputOpenError = null
                     }
                 }
 
                 is CameraCaptureEvent.RawBurstFinished -> {
-                    savedTiffUri = event.superResolutionUri?.let(Uri::parse)
+                    savedSuperResolution = event.superResolutionJpegUri?.let { Uri.parse(it) to "image/jpeg" }
+                        ?: event.superResolutionUri?.let { Uri.parse(it) to "image/tiff" }
                     savedPreviewUri = event.fusionPreviewUri?.let(Uri::parse)
                     outputOpenError = null
                     val outputs = buildList {
                         if (event.superResolutionWidth > 0 && event.superResolutionHeight > 0) {
                             val megapixels = (event.superResolutionWidth.toLong() *
                                 event.superResolutionHeight + 500_000L) / 1_000_000L
-                            add("${megapixels} MP 2× TIFF prototype (${event.superResolutionFrames} aligned frames)")
+                            val formats = if (event.superResolutionJpegUri != null) "TIFF + JPEG" else "TIFF"
+                            add("${megapixels} MP 2× $formats prototype (${event.superResolutionFrames} aligned frames)")
                         }
                         if (event.fusionPreviewSaved) add("fusion preview")
                     }
@@ -289,14 +288,19 @@ private fun CameraPreview() {
         val lifecycleObserver = LifecycleEventObserver { _, event ->
             when (event) {
                 Lifecycle.Event.ON_RESUME -> {
-                    latestHolder.value?.let { holder ->
-                        controller.startPreview(
-                            holder,
-                            latestDisplayRotation.value,
-                            latestViewWidth.value,
-                            latestViewHeight.value,
-                        )
-                    }
+                    // Read the snapshot state directly: when returning from the background the
+                    // surface is often recreated just before ON_RESUME (so surfaceCreated skips the
+                    // start), and a rememberUpdatedState copy would still hold null until the next
+                    // recomposition, leaving the camera stopped.
+                    currentHolder?.takeIf { it.surface.isValid && currentViewWidth > 0 && currentViewHeight > 0 }
+                        ?.let { holder ->
+                            controller.startPreview(
+                                holder,
+                                currentDisplayRotation,
+                                currentViewWidth,
+                                currentViewHeight,
+                            )
+                        }
                 }
                 Lifecycle.Event.ON_STOP -> controller.stopPreview()
                 else -> Unit
@@ -498,14 +502,14 @@ private fun CameraPreview() {
                         color = MaterialTheme.colorScheme.onSurface,
                         style = MaterialTheme.typography.labelMedium,
                     )
-                    if (savedTiffUri != null || savedPreviewUri != null) {
+                    if (savedSuperResolution != null || savedPreviewUri != null) {
                         Row(horizontalArrangement = Arrangement.Center) {
-                            savedTiffUri?.let { uri ->
+                            savedSuperResolution?.let { (uri, mimeType) ->
                                 TextButton(
                                     onClick = {
-                                        outputOpenError = openSavedImage(context, uri, "image/tiff")
+                                        outputOpenError = openSavedImage(context, uri, mimeType)
                                     },
-                                ) { Text("Open 2× TIFF") }
+                                ) { Text(if (mimeType == "image/jpeg") "Open 2× JPEG" else "Open 2× TIFF") }
                             }
                             savedPreviewUri?.let { uri ->
                                 TextButton(
@@ -536,7 +540,11 @@ private fun CameraPreview() {
                     "RAW unavailable in this camera session"
                 }
                 is RawBurstState.Capturing -> if (burst.finalizing) {
-                    "Reconstructing 2× TIFF · ${burst.savedFrames}/${burst.totalFrames}"
+                    if (burst.savedFrames < burst.totalFrames) {
+                        "Processing RAW frames · ${burst.savedFrames}/${burst.totalFrames}"
+                    } else {
+                        "Reconstructing 2× TIFF + JPEG"
+                    }
                 } else {
                     "RAW burst · ${burst.savedFrames}/${burst.totalFrames}"
                 }
@@ -546,7 +554,8 @@ private fun CameraPreview() {
                             if (burst.superResolutionWidth > 0 && burst.superResolutionHeight > 0) {
                                 val megapixels = (burst.superResolutionWidth.toLong() *
                                     burst.superResolutionHeight + 500_000L) / 1_000_000L
-                                add("${megapixels} MP 2× TIFF · ${burst.superResolutionFrames} frames")
+                                val formats = if (burst.superResolutionJpegUri != null) "TIFF + JPEG" else "TIFF"
+                                add("${megapixels} MP 2× $formats · ${burst.superResolutionFrames} frames")
                             }
                             if (burst.fusionPreviewSaved) add("preview")
                         }

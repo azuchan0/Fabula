@@ -23,11 +23,17 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
 import android.os.Build
+import android.util.Log
 import android.util.Size
 import android.util.Range
 import android.util.Rational
 import android.view.Surface
 import android.view.SurfaceHolder
+import java.io.File
+import java.io.RandomAccessFile
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -63,6 +69,7 @@ sealed interface CameraCaptureEvent {
         val superResolutionHeight: Int,
         val superResolutionFrames: Int,
         val superResolutionUri: String?,
+        val superResolutionJpegUri: String?,
         val fusionPreviewUri: String?,
     ) : CameraCaptureEvent
 }
@@ -73,12 +80,29 @@ data class RawBurstFinishResult(
     val superResolutionHeight: Int = 0,
     val superResolutionFrames: Int = 0,
     val superResolutionUri: String? = null,
+    val superResolutionJpegUri: String? = null,
     val fusionPreviewUri: String? = null,
+)
+
+/**
+ * A RAW_SENSOR frame copied out of the camera buffer (16-bit little-endian samples). The buffer is
+ * direct, so native code can read it without another copy. [spoolFile], when set, holds the same
+ * packed samples and stays readable while the frame is processed, so the burst fusion can map it
+ * instead of copying it; the buffer itself is reused for the next frame once processing returns.
+ */
+class RawFrameData(
+    val width: Int,
+    val height: Int,
+    val rowStride: Int,
+    val pixelStride: Int,
+    val buffer: ByteBuffer,
+    val timestampNs: Long,
+    val spoolFile: File? = null,
 )
 
 fun interface RawFrameWriter {
     fun writeDngFrame(
-        image: Image,
+        frame: RawFrameData,
         characteristics: CameraCharacteristics,
         captureResult: TotalCaptureResult,
         burstId: String,
@@ -106,6 +130,7 @@ sealed interface RawBurstState {
         val superResolutionHeight: Int,
         val superResolutionFrames: Int,
         val superResolutionUri: String?,
+        val superResolutionJpegUri: String?,
         val fusionPreviewUri: String?,
     ) : RawBurstState
     data class Failed(val message: String) : RawBurstState
@@ -182,10 +207,18 @@ private class RawBurstRun(
 ) {
     val pendingResults = mutableMapOf<Long, RawCaptureMetadata>()
     val pendingImages = mutableMapOf<Long, Image>()
-    var savedFrames = 0
+    val lostFrameIndices = mutableSetOf<Int>()
+    // Camera thread: frames copied to the spool and handed to processing, or lost before that.
+    var spooledFrames = 0
     var failedFrames = 0
     var sequenceCompleted = false
     var completionTimeoutScheduled = false
+
+    // Written on the processing thread, read for progress and the final state.
+    @Volatile var savedFrames = 0
+    @Volatile var processingFailures = 0
+    @Volatile var handedOff = false
+    @Volatile var completed = false
 }
 
 /** Owns Camera2 objects and confines their state callbacks to one camera thread. */
@@ -200,6 +233,14 @@ class Camera2PreviewController(
     private val cameraThread = HandlerThread("FabulaCamera2").apply { start() }
     private val cameraHandler = Handler(cameraThread.looper)
     private val mainHandler = Handler(Looper.getMainLooper())
+
+    // DNG writing and burst fusion run here, in capture order, so the camera thread only copies
+    // RAW frames and never holds camera buffers while a frame is being processed.
+    private val processingThread = HandlerThread("FabulaRawProcessing").apply { start() }
+    private val processingHandler = Handler(processingThread.looper)
+    private val rawSpoolDirectory = File(appContext.cacheDir, "Fabula_raw_spool").apply {
+        listFiles()?.forEach(File::delete)
+    }
 
     private val mutableState = MutableStateFlow<CameraPreviewState>(CameraPreviewState.Idle)
     val state: StateFlow<CameraPreviewState> = mutableState.asStateFlow()
@@ -406,6 +447,11 @@ class Camera2PreviewController(
                                 maybeFinishRawBurst(burst)
                                 return
                             }
+                            if (frameIndex in burst.lostFrameIndices) {
+                                // Already counted as failed; no image will ever match this result.
+                                maybeFinishRawBurst(burst)
+                                return
+                            }
 
                             val waitingImage = burst.pendingImages.remove(timestamp)
                             if (waitingImage != null) {
@@ -424,6 +470,32 @@ class Camera2PreviewController(
                             mutableCaptureEvents.tryEmit(
                                 CameraCaptureEvent.Failed(
                                     "RAW frame ${burst.failedFrames + burst.savedFrames} failed (reason ${failure.reason}).",
+                                ),
+                            )
+                            updateRawBurstProgress(burst)
+                            maybeFinishRawBurst(burst)
+                        }
+
+                        // The HAL drops a RAW buffer when the reader stays full for too long (every
+                        // buffer held while earlier frames are written and fused). Without this the
+                        // frame is never accounted for and the burst waits for the drain timeout.
+                        override fun onCaptureBufferLost(
+                            session: CameraCaptureSession,
+                            request: CaptureRequest,
+                            target: Surface,
+                            frameNumber: Long,
+                        ) {
+                            if (target != reader.surface) return
+                            val frameIndex = request.tag as? Int
+                            if (frameIndex != null) {
+                                if (!burst.lostFrameIndices.add(frameIndex)) return
+                                burst.pendingResults.entries.removeAll { it.value.frameIndex == frameIndex }
+                            }
+                            burst.failedFrames++
+                            Log.w(TAG, "RAW buffer lost for burst frame ${frameIndex?.plus(1)} (frame $frameNumber).")
+                            mutableCaptureEvents.tryEmit(
+                                CameraCaptureEvent.Failed(
+                                    "RAW frame ${frameIndex?.plus(1) ?: "?"} was dropped by the camera.",
                                 ),
                             )
                             updateRawBurstProgress(burst)
@@ -450,7 +522,7 @@ class Camera2PreviewController(
                     cameraHandler,
                 )
             } catch (exception: Exception) {
-                runCatching { writer?.finishBurst(burstId) }
+                processingHandler.post { runCatching { writer.finishBurst(burstId) } }
                 activeRawBurst = null
                 burst.pendingImages.values.forEach(Image::close)
                 burst.pendingImages.clear()
@@ -955,7 +1027,13 @@ class Camera2PreviewController(
                     }
 
                     override fun onClosed(device: CameraDevice) {
-                        if (cameraDevice === device) cameraDevice = null
+                        if (cameraDevice === device) {
+                            cameraDevice = null
+                            // A session cannot outlive its device, and when the device closes first
+                            // (leaving the app) the session's own onClosed is not always delivered;
+                            // a stale session would block every later reopen.
+                            captureSession = null
+                        }
                         resumeDesiredPreviewAfterClose()
                         shutdownWorkerIfReleased()
                     }
@@ -1590,7 +1668,7 @@ class Camera2PreviewController(
             } ?: break
 
             val burst = activeRawBurst
-            if (burst == null) {
+            if (burst == null || burst.handedOff) {
                 image.close()
                 continue
             }
@@ -1613,6 +1691,11 @@ class Camera2PreviewController(
         }
     }
 
+    /**
+     * Copies the RAW plane into a packed spool file and releases the camera buffer at once, then
+     * queues the slow DNG writing and fusion on the processing thread. Holding camera buffers while
+     * frames are processed (2-4 s each) made the HAL drop the tail of long bursts.
+     */
     private fun saveRawFrame(
         burst: RawBurstRun,
         image: Image,
@@ -1620,40 +1703,129 @@ class Camera2PreviewController(
         result: TotalCaptureResult,
         config: PreviewConfig,
     ) {
-        try {
-            val writer = rawFrameWriter
-                ?: throw IllegalStateException("The DNG writer is unavailable.")
-            writer.writeDngFrame(
-                image = image,
-                characteristics = config.characteristics,
-                captureResult = result,
-                burstId = burst.burstId,
-                frameIndex = frameIndex,
-                orientationDegrees = config.jpegOrientation,
-            )
-            burst.savedFrames++
+        val writer = rawFrameWriter
+        val spooled = try {
+            checkNotNull(writer) { "The DNG writer is unavailable." }
+            spoolRawImage(image, burst.burstId, frameIndex)
         } catch (exception: Exception) {
             burst.failedFrames++
             mutableCaptureEvents.tryEmit(
                 CameraCaptureEvent.Failed(
-                    "Failed to write DNG ${frameIndex + 1}: " +
+                    "Failed to buffer RAW frame ${frameIndex + 1}: " +
                         (exception.message ?: "unknown error"),
                 ),
             )
+            null
         } finally {
             image.close()
         }
-        updateRawBurstProgress(burst)
-        maybeFinishRawBurst(burst)
+        if (spooled == null || writer == null) {
+            updateRawBurstProgress(burst)
+            maybeFinishRawBurst(burst)
+            return
+        }
+
+        burst.spooledFrames++
+        processingHandler.post {
+            try {
+                writer.writeDngFrame(
+                    frame = loadSpooledFrame(spooled),
+                    characteristics = config.characteristics,
+                    captureResult = result,
+                    burstId = burst.burstId,
+                    frameIndex = frameIndex,
+                    orientationDegrees = config.jpegOrientation,
+                )
+                burst.savedFrames++
+            } catch (exception: Exception) {
+                burst.processingFailures++
+                mutableCaptureEvents.tryEmit(
+                    CameraCaptureEvent.Failed(
+                        "Failed to write DNG ${frameIndex + 1}: " +
+                            (exception.message ?: "unknown error"),
+                    ),
+                )
+            } finally {
+                spooled.file.delete()
+            }
+            updateRawBurstProgress(burst)
+        }
     }
 
+    private class SpooledRawFrame(
+        val file: File,
+        val width: Int,
+        val height: Int,
+        val timestampNs: Long,
+    )
+
+    // Processing thread only: one reusable direct buffer, so frames waiting in the spool cost
+    // disk space instead of memory.
+    private var processingBuffer: ByteBuffer? = null
+
+    private fun loadSpooledFrame(spooled: SpooledRawFrame): RawFrameData {
+        val byteCount = spooled.width * spooled.height * RAW_BYTES_PER_PIXEL
+        val buffer = processingBuffer?.takeIf { it.capacity() == byteCount }
+            ?: ByteBuffer.allocateDirect(byteCount).order(ByteOrder.LITTLE_ENDIAN).also {
+                processingBuffer = it
+            }
+        buffer.clear()
+        RandomAccessFile(spooled.file, "r").use { input ->
+            val channel = input.channel
+            while (buffer.hasRemaining()) {
+                if (channel.read(buffer) < 0) throw java.io.EOFException("Truncated RAW spool file.")
+            }
+        }
+        buffer.flip()
+        return RawFrameData(
+            width = spooled.width,
+            height = spooled.height,
+            rowStride = spooled.width * RAW_BYTES_PER_PIXEL,
+            pixelStride = RAW_BYTES_PER_PIXEL,
+            buffer = buffer,
+            timestampNs = spooled.timestampNs,
+            spoolFile = spooled.file,
+        )
+    }
+
+    private fun spoolRawImage(image: Image, burstId: String, frameIndex: Int): SpooledRawFrame {
+        val plane = image.planes.firstOrNull()
+            ?: throw IllegalArgumentException("The RAW_SENSOR image has no plane.")
+        val width = image.width
+        val height = image.height
+        val pixelStride = plane.pixelStride
+        require(pixelStride == RAW_BYTES_PER_PIXEL) { "Unexpected RAW pixel stride $pixelStride." }
+        val packedRowBytes = width * RAW_BYTES_PER_PIXEL
+        val source = plane.buffer.duplicate()
+        rawSpoolDirectory.mkdirs()
+        val file = File(rawSpoolDirectory, "${burstId}_${frameIndex}.raw16")
+        try {
+            RandomAccessFile(file, "rw").use { output ->
+                val channel = output.channel
+                for (row in 0 until height) {
+                    val rowStart = row * plane.rowStride
+                    source.limit(rowStart + packedRowBytes)
+                    source.position(rowStart)
+                    while (source.hasRemaining()) channel.write(source)
+                    source.limit(source.capacity())
+                }
+            }
+            return SpooledRawFrame(file, width, height, image.timestamp)
+        } catch (exception: Exception) {
+            file.delete()
+            throw exception
+        }
+    }
+
+    // Reads savedFrames, which only the processing thread writes; the flows are thread-safe.
     private fun updateRawBurstProgress(burst: RawBurstRun) {
-        if (activeRawBurst !== burst) return
+        if (burst.completed) return
         val saved = burst.savedFrames.coerceAtMost(burst.totalFrames)
         mutableRawBurstState.value = RawBurstState.Capturing(
             burstId = burst.burstId,
             savedFrames = saved,
             totalFrames = burst.totalFrames,
+            finalizing = burst.handedOff,
         )
         mutableCaptureEvents.tryEmit(
             CameraCaptureEvent.RawBurstProgress(burst.burstId, saved, burst.totalFrames),
@@ -1661,48 +1833,58 @@ class Camera2PreviewController(
     }
 
     private fun maybeFinishRawBurst(burst: RawBurstRun) {
-        if (activeRawBurst !== burst) return
+        if (activeRawBurst !== burst || burst.handedOff) return
 
-        val accountedFrames = burst.savedFrames + burst.failedFrames
+        val accountedFrames = burst.spooledFrames + burst.failedFrames
         if (burst.sequenceCompleted && accountedFrames >= burst.totalFrames &&
             burst.pendingImages.isEmpty() && burst.pendingResults.isEmpty()
         ) {
-            finishRawBurst(burst)
+            handOffRawBurst(burst)
             return
         }
 
         if (burst.sequenceCompleted && !burst.completionTimeoutScheduled) {
             burst.completionTimeoutScheduled = true
             cameraHandler.postDelayed({
-                if (activeRawBurst !== burst) return@postDelayed
-                val missingFrames = (burst.totalFrames - burst.savedFrames - burst.failedFrames)
+                if (activeRawBurst !== burst || burst.handedOff) return@postDelayed
+                val missingFrames = (burst.totalFrames - burst.spooledFrames - burst.failedFrames)
                     .coerceAtLeast(0)
-                burst.pendingImages.values.forEach(Image::close)
-                burst.pendingImages.clear()
-                burst.pendingResults.clear()
+                Log.w(
+                    TAG,
+                    "RAW burst ${burst.burstId} drain timeout: $missingFrames frames never arrived, " +
+                        "${burst.pendingImages.size} images and ${burst.pendingResults.size} results unmatched.",
+                )
                 burst.failedFrames += missingFrames
-                finishRawBurst(burst)
+                handOffRawBurst(burst)
             }, RAW_BURST_DRAIN_TIMEOUT_MS)
         }
     }
 
-    private fun finishRawBurst(burst: RawBurstRun) {
-        if (activeRawBurst !== burst) return
-        mutableRawBurstState.value = RawBurstState.Capturing(
-            burstId = burst.burstId,
-            savedFrames = burst.savedFrames.coerceAtMost(burst.totalFrames),
-            totalFrames = burst.totalFrames,
-            finalizing = true,
-        )
-        val finishResult = runCatching {
-            rawFrameWriter?.finishBurst(burst.burstId) ?: RawBurstFinishResult()
-        }.getOrDefault(RawBurstFinishResult())
+    /**
+     * Capture is over for this burst (camera thread). The finish step is queued behind every
+     * spooled frame on the processing thread, so it runs once they are all written and fused.
+     */
+    private fun handOffRawBurst(burst: RawBurstRun) {
+        if (burst.handedOff) return
+        burst.handedOff = true
         burst.pendingImages.values.forEach(Image::close)
         burst.pendingImages.clear()
         burst.pendingResults.clear()
-        activeRawBurst = null
+        updateRawBurstProgress(burst)
+        processingHandler.post { completeRawBurst(burst) }
+    }
+
+    private fun completeRawBurst(burst: RawBurstRun) {
+        val finishResult = runCatching {
+            rawFrameWriter?.finishBurst(burst.burstId) ?: RawBurstFinishResult()
+        }.getOrDefault(RawBurstFinishResult())
+        burst.completed = true
+        cameraHandler.post {
+            if (activeRawBurst === burst) activeRawBurst = null
+        }
 
         val savedFrames = burst.savedFrames.coerceAtMost(burst.totalFrames)
+        val failedFrames = burst.failedFrames + burst.processingFailures
         mutableRawBurstState.value = if (savedFrames > 0) {
             RawBurstState.Completed(
                 burstId = burst.burstId,
@@ -1713,11 +1895,12 @@ class Camera2PreviewController(
                 superResolutionHeight = finishResult.superResolutionHeight,
                 superResolutionFrames = finishResult.superResolutionFrames,
                 superResolutionUri = finishResult.superResolutionUri,
+                superResolutionJpegUri = finishResult.superResolutionJpegUri,
                 fusionPreviewUri = finishResult.fusionPreviewUri,
             )
         } else {
             RawBurstState.Failed(
-                "No DNG frames were saved (${burst.failedFrames}/${burst.totalFrames} frames failed). " +
+                "No DNG frames were saved ($failedFrames/${burst.totalFrames} frames failed). " +
                     "The camera may advertise RAW_SENSOR without delivering RAW images for this session.",
             )
         }
@@ -1731,6 +1914,7 @@ class Camera2PreviewController(
                 superResolutionHeight = finishResult.superResolutionHeight,
                 superResolutionFrames = finishResult.superResolutionFrames,
                 superResolutionUri = finishResult.superResolutionUri,
+                superResolutionJpegUri = finishResult.superResolutionJpegUri,
                 fusionPreviewUri = finishResult.fusionPreviewUri,
             ),
         )
@@ -1844,12 +2028,22 @@ class Camera2PreviewController(
 
     private fun closeActiveResources() {
         activeRawBurst?.let { burst ->
-            runCatching { rawFrameWriter?.finishBurst(burst.burstId) }
-            burst.pendingImages.values.forEach(Image::close)
-            burst.pendingImages.clear()
-            burst.pendingResults.clear()
+            if (!burst.handedOff) {
+                // Frames already copied to the spool are still written and fused; only the frames
+                // that never left the camera are lost.
+                val missingFrames = (burst.totalFrames - burst.spooledFrames - burst.failedFrames)
+                    .coerceAtLeast(0)
+                burst.failedFrames += missingFrames
+                if (missingFrames > 0) {
+                    mutableCaptureEvents.tryEmit(
+                        CameraCaptureEvent.Failed(
+                            "The RAW burst was interrupted; $missingFrames frames were not captured.",
+                        ),
+                    )
+                }
+                handOffRawBurst(burst)
+            }
             activeRawBurst = null
-            mutableRawBurstState.value = RawBurstState.Failed("The RAW burst was interrupted.")
         }
         captureSession?.close()
         cameraDevice?.close()
@@ -1878,6 +2072,8 @@ class Camera2PreviewController(
         ) {
             workerShutdown = true
             cameraThread.quitSafely()
+            // Queued frames and the burst finish step still run before the thread exits.
+            processingThread.quitSafely()
         }
     }
 
@@ -1895,5 +2091,7 @@ class Camera2PreviewController(
         const val CAMERA_RECOVERY_DELAY_MS = 500L
         const val MAX_CAMERA_RECOVERY_ATTEMPTS = 2
         const val RAW_BURST_DRAIN_TIMEOUT_MS = 15_000L
+        const val TAG = "Camera2PreviewController"
+        const val RAW_BYTES_PER_PIXEL = 2
     }
 }

@@ -1,9 +1,8 @@
 package com.azuchan.fabula.ui.camera
 
-import android.graphics.ImageFormat
-import android.media.Image
 import android.os.ParcelFileDescriptor
 import androidx.annotation.Keep
+import com.azuchan.fabula.camera.RawFrameData
 import java.io.Closeable
 import java.io.File
 import java.nio.ByteBuffer
@@ -45,23 +44,29 @@ data class RawFusionTiff(
     val contributingFrames: Int,
     val file: File? = null,
     val mediaUri: String? = null,
+    val jpegFile: File? = null,
+    val jpegMediaUri: String? = null,
 )
 
-/** Estimates whole-frame translation against the first RAW frame using a bounded native proxy. */
+/**
+ * Aligns a RAW burst against its first frame (native proxies), builds a reduced fused preview, and,
+ * when [superResolutionEnabled], keeps every frame (mapped from its spool file) for the final
+ * banded 2x reconstruction.
+ */
 @Keep
-class NativeRawBurstAligner(scratchFile: File?) : Closeable {
+class NativeRawBurstAligner(superResolutionEnabled: Boolean) : Closeable {
     private var nativeHandle: Long
     private var previewWidth = 0
     private var previewHeight = 0
 
     init {
         System.loadLibrary("fabula")
-        nativeHandle = createAligner(scratchFile?.absolutePath.orEmpty())
+        nativeHandle = createAligner(superResolutionEnabled)
         check(nativeHandle != 0L) { "Could not create the native RAW burst aligner." }
     }
 
     fun addFrame(
-        image: Image,
+        frame: RawFrameData,
         cfaChannels: IntArray,
         blackLevels: DoubleArray,
         whiteLevel: Double,
@@ -69,22 +74,18 @@ class NativeRawBurstAligner(scratchFile: File?) : Closeable {
         colorMatrix: DoubleArray = doubleArrayOf(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0),
     ): RawFrameAlignment {
         check(nativeHandle != 0L) { "The native RAW burst aligner is closed." }
-        require(image.format == ImageFormat.RAW_SENSOR) {
-            "The aligner expects a RAW_SENSOR image."
-        }
-        val plane = image.planes.firstOrNull()
-            ?: throw IllegalArgumentException("The RAW_SENSOR image has no plane.")
         return addBuffer(
-            buffer = plane.buffer,
-            width = image.width,
-            height = image.height,
-            rowStride = plane.rowStride,
-            pixelStride = plane.pixelStride,
+            buffer = frame.buffer,
+            width = frame.width,
+            height = frame.height,
+            rowStride = frame.rowStride,
+            pixelStride = frame.pixelStride,
             cfaChannels = cfaChannels,
             blackLevels = blackLevels,
             whiteLevel = whiteLevel,
             colorGains = colorGains,
             colorMatrix = colorMatrix,
+            spoolPath = frame.spoolFile?.absolutePath,
         )
     }
 
@@ -99,6 +100,7 @@ class NativeRawBurstAligner(scratchFile: File?) : Closeable {
         whiteLevel: Double = 65535.0,
         colorGains: DoubleArray = doubleArrayOf(1.0, 1.0, 1.0),
         colorMatrix: DoubleArray = doubleArrayOf(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0),
+        spoolPath: String? = null,
     ): RawFrameAlignment {
         check(nativeHandle != 0L) { "The native RAW burst aligner is closed." }
         require(buffer.isDirect) {
@@ -124,6 +126,7 @@ class NativeRawBurstAligner(scratchFile: File?) : Closeable {
             whiteLevel = whiteLevel,
             colorGains = colorGains,
             colorMatrix = colorMatrix,
+            spoolPath = spoolPath,
         )
         check(values.size == RESULT_LENGTH) {
             "The native RAW burst aligner returned an invalid result."
@@ -171,12 +174,17 @@ class NativeRawBurstAligner(scratchFile: File?) : Closeable {
         )
     }
 
-    fun writeSuperResolutionTiff(outputFile: File, orientationDegrees: Int): RawFusionTiff? {
+    /**
+     * Renders the 2x reconstruction from every stored frame, writing the TIFF and, when
+     * [jpegFile] is set, a full-resolution JPEG that phone galleries can open.
+     */
+    fun writeSuperResolution(tiffFile: File, jpegFile: File?, orientationDegrees: Int): RawFusionTiff? {
         check(nativeHandle != 0L) { "The native RAW burst aligner is closed." }
         if (previewWidth == 0 || previewHeight == 0) return null
-        val dimensions = nativeWriteSuperResolutionTiff(
+        val dimensions = nativeWriteSuperResolutionFiles(
             handle = nativeHandle,
-            outputPath = outputFile.absolutePath,
+            tiffPath = tiffFile.absolutePath,
+            jpegPath = jpegFile?.absolutePath,
             orientation = orientationDegrees,
         )
         if (dimensions.size != TIFF_RESULT_LENGTH) return null
@@ -184,19 +192,22 @@ class NativeRawBurstAligner(scratchFile: File?) : Closeable {
             width = dimensions[0],
             height = dimensions[1],
             contributingFrames = dimensions[2],
-            file = outputFile,
+            file = tiffFile,
+            jpegFile = jpegFile,
         )
     }
 
-    fun writeSuperResolutionTiff(
-        outputDescriptor: ParcelFileDescriptor,
+    fun writeSuperResolution(
+        tiffDescriptor: ParcelFileDescriptor,
+        jpegDescriptor: ParcelFileDescriptor?,
         orientationDegrees: Int,
     ): RawFusionTiff? {
         check(nativeHandle != 0L) { "The native RAW burst aligner is closed." }
         if (previewWidth == 0 || previewHeight == 0) return null
-        val dimensions = nativeWriteSuperResolutionTiffToDescriptor(
+        val dimensions = nativeWriteSuperResolutionToDescriptors(
             handle = nativeHandle,
-            outputDescriptor = outputDescriptor,
+            tiffDescriptor = tiffDescriptor,
+            jpegDescriptor = jpegDescriptor,
             orientation = orientationDegrees,
         )
         if (dimensions.size != TIFF_RESULT_LENGTH) return null
@@ -215,7 +226,7 @@ class NativeRawBurstAligner(scratchFile: File?) : Closeable {
         }
     }
 
-    private external fun createAligner(scratchPath: String): Long
+    private external fun createAligner(superResolutionEnabled: Boolean): Long
 
     @Keep
     private external fun nativeAddFrame(
@@ -230,22 +241,25 @@ class NativeRawBurstAligner(scratchFile: File?) : Closeable {
         whiteLevel: Double,
         colorGains: DoubleArray,
         colorMatrix: DoubleArray,
+        spoolPath: String?,
     ): DoubleArray
 
     @Keep
     private external fun nativeFinishFusionPreview(handle: Long): IntArray
 
     @Keep
-    private external fun nativeWriteSuperResolutionTiff(
+    private external fun nativeWriteSuperResolutionFiles(
         handle: Long,
-        outputPath: String,
+        tiffPath: String,
+        jpegPath: String?,
         orientation: Int,
     ): IntArray
 
     @Keep
-    private external fun nativeWriteSuperResolutionTiffToDescriptor(
+    private external fun nativeWriteSuperResolutionToDescriptors(
         handle: Long,
-        outputDescriptor: ParcelFileDescriptor,
+        tiffDescriptor: ParcelFileDescriptor,
+        jpegDescriptor: ParcelFileDescriptor?,
         orientation: Int,
     ): IntArray
 
