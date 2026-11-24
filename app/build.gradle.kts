@@ -60,7 +60,6 @@ dependencies {
     implementation(libs.androidx.lifecycle.runtime.compose)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
     // Retained for the unused Android Studio starter XML layout until it is cleaned up later.
-    implementation(libs.androidx.constraintlayout)
     implementation(libs.androidx.compose.ui)
     implementation(libs.androidx.compose.ui.graphics)
     implementation(libs.androidx.compose.ui.tooling.preview)

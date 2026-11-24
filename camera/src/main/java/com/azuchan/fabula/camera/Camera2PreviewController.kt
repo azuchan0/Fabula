@@ -21,6 +21,7 @@ import android.media.Image
 import android.media.ImageReader
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.Looper
 import android.os.Build
 import android.util.Size
 import android.util.Range
@@ -53,8 +54,27 @@ sealed interface CameraCaptureEvent {
     data class JpegReady(val bytes: ByteArray) : CameraCaptureEvent
     data class Failed(val message: String) : CameraCaptureEvent
     data class RawBurstProgress(val burstId: String, val savedFrames: Int, val totalFrames: Int) : CameraCaptureEvent
-    data class RawBurstFinished(val burstId: String, val savedFrames: Int, val totalFrames: Int) : CameraCaptureEvent
+    data class RawBurstFinished(
+        val burstId: String,
+        val savedFrames: Int,
+        val totalFrames: Int,
+        val fusionPreviewSaved: Boolean,
+        val superResolutionWidth: Int,
+        val superResolutionHeight: Int,
+        val superResolutionFrames: Int,
+        val superResolutionUri: String?,
+        val fusionPreviewUri: String?,
+    ) : CameraCaptureEvent
 }
+
+data class RawBurstFinishResult(
+    val fusionPreviewSaved: Boolean = false,
+    val superResolutionWidth: Int = 0,
+    val superResolutionHeight: Int = 0,
+    val superResolutionFrames: Int = 0,
+    val superResolutionUri: String? = null,
+    val fusionPreviewUri: String? = null,
+)
 
 fun interface RawFrameWriter {
     fun writeDngFrame(
@@ -65,12 +85,29 @@ fun interface RawFrameWriter {
         frameIndex: Int,
         orientationDegrees: Int,
     ): String
+
+    fun finishBurst(burstId: String): RawBurstFinishResult = RawBurstFinishResult()
 }
 
 sealed interface RawBurstState {
     data object Idle : RawBurstState
-    data class Capturing(val burstId: String, val savedFrames: Int, val totalFrames: Int) : RawBurstState
-    data class Completed(val burstId: String, val savedFrames: Int, val totalFrames: Int) : RawBurstState
+    data class Capturing(
+        val burstId: String,
+        val savedFrames: Int,
+        val totalFrames: Int,
+        val finalizing: Boolean = false,
+    ) : RawBurstState
+    data class Completed(
+        val burstId: String,
+        val savedFrames: Int,
+        val totalFrames: Int,
+        val fusionPreviewSaved: Boolean,
+        val superResolutionWidth: Int,
+        val superResolutionHeight: Int,
+        val superResolutionFrames: Int,
+        val superResolutionUri: String?,
+        val fusionPreviewUri: String?,
+    ) : RawBurstState
     data class Failed(val message: String) : RawBurstState
 }
 
@@ -162,6 +199,7 @@ class Camera2PreviewController(
 
     private val cameraThread = HandlerThread("FabulaCamera2").apply { start() }
     private val cameraHandler = Handler(cameraThread.looper)
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     private val mutableState = MutableStateFlow<CameraPreviewState>(CameraPreviewState.Idle)
     val state: StateFlow<CameraPreviewState> = mutableState.asStateFlow()
@@ -412,6 +450,7 @@ class Camera2PreviewController(
                     cameraHandler,
                 )
             } catch (exception: Exception) {
+                runCatching { writer?.finishBurst(burstId) }
                 activeRawBurst = null
                 burst.pendingImages.values.forEach(Image::close)
                 burst.pendingImages.clear()
@@ -829,11 +868,53 @@ class Camera2PreviewController(
         updateExposureCapabilities(config)
         updateWhiteBalanceAndFocusCapabilities(config)
 
-        // Match the buffer dimensions to a stream size advertised by Camera2.
-        holder.setFixedSize(config.previewSize.width, config.previewSize.height)
         cameraOpenPending = true
         mutableState.value = CameraPreviewState.Opening
 
+        // SurfaceHolder mutates a View-backed surface, so its fixed size must be set on main.
+        mainHandler.post {
+            try {
+                holder.setFixedSize(config.previewSize.width, config.previewSize.height)
+                cameraHandler.post {
+                    if (requestGeneration != generation || desiredHolder !== holder ||
+                        releaseRequested || !holder.surface.isValid
+                    ) {
+                        cameraOpenPending = false
+                        openDesiredPreviewWhenReady()
+                        shutdownWorkerIfReleased()
+                    } else {
+                        openCameraDevice(holder, config, requestGeneration)
+                    }
+                }
+            } catch (exception: Exception) {
+                cameraHandler.post {
+                    cameraOpenPending = false
+                    if (requestGeneration == generation && desiredHolder === holder && !releaseRequested) {
+                        failCurrentRequest(
+                            requestGeneration,
+                            exception.message ?: "Could not set the preview buffer size.",
+                        )
+                    } else {
+                        openDesiredPreviewWhenReady()
+                        shutdownWorkerIfReleased()
+                    }
+                }
+            }
+        }
+    }
+
+    private fun openCameraDevice(
+        holder: SurfaceHolder,
+        config: PreviewConfig,
+        requestGeneration: Long,
+    ) {
+        if (appContext.checkSelfPermission(Manifest.permission.CAMERA) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            cameraOpenPending = false
+            failCurrentRequest(requestGeneration, "Camera permission has not been granted.")
+            return
+        }
         try {
             cameraManager.openCamera(
                 config.cameraId,
@@ -1351,7 +1432,10 @@ class Camera2PreviewController(
         lockForBurst: Boolean = false,
     ) {
         val controls = mutableWhiteBalanceControls.value
-        if (controls.mode == CameraWhiteBalanceMode.CCT && controls.cctSupported) {
+        if (Build.VERSION.SDK_INT >= 36 &&
+            controls.mode == CameraWhiteBalanceMode.CCT &&
+            controls.cctSupported
+        ) {
             builder.set(
                 CaptureRequest.CONTROL_AWB_MODE,
                 CameraMetadata.CONTROL_AWB_MODE_OFF,
@@ -1604,6 +1688,15 @@ class Camera2PreviewController(
 
     private fun finishRawBurst(burst: RawBurstRun) {
         if (activeRawBurst !== burst) return
+        mutableRawBurstState.value = RawBurstState.Capturing(
+            burstId = burst.burstId,
+            savedFrames = burst.savedFrames.coerceAtMost(burst.totalFrames),
+            totalFrames = burst.totalFrames,
+            finalizing = true,
+        )
+        val finishResult = runCatching {
+            rawFrameWriter?.finishBurst(burst.burstId) ?: RawBurstFinishResult()
+        }.getOrDefault(RawBurstFinishResult())
         burst.pendingImages.values.forEach(Image::close)
         burst.pendingImages.clear()
         burst.pendingResults.clear()
@@ -1611,12 +1704,35 @@ class Camera2PreviewController(
 
         val savedFrames = burst.savedFrames.coerceAtMost(burst.totalFrames)
         mutableRawBurstState.value = if (savedFrames > 0) {
-            RawBurstState.Completed(burst.burstId, savedFrames, burst.totalFrames)
+            RawBurstState.Completed(
+                burstId = burst.burstId,
+                savedFrames = savedFrames,
+                totalFrames = burst.totalFrames,
+                fusionPreviewSaved = finishResult.fusionPreviewSaved,
+                superResolutionWidth = finishResult.superResolutionWidth,
+                superResolutionHeight = finishResult.superResolutionHeight,
+                superResolutionFrames = finishResult.superResolutionFrames,
+                superResolutionUri = finishResult.superResolutionUri,
+                fusionPreviewUri = finishResult.fusionPreviewUri,
+            )
         } else {
-            RawBurstState.Failed("No DNG files could be saved.")
+            RawBurstState.Failed(
+                "No DNG frames were saved (${burst.failedFrames}/${burst.totalFrames} frames failed). " +
+                    "The camera may advertise RAW_SENSOR without delivering RAW images for this session.",
+            )
         }
         mutableCaptureEvents.tryEmit(
-            CameraCaptureEvent.RawBurstFinished(burst.burstId, savedFrames, burst.totalFrames),
+            CameraCaptureEvent.RawBurstFinished(
+                burstId = burst.burstId,
+                savedFrames = savedFrames,
+                totalFrames = burst.totalFrames,
+                fusionPreviewSaved = finishResult.fusionPreviewSaved,
+                superResolutionWidth = finishResult.superResolutionWidth,
+                superResolutionHeight = finishResult.superResolutionHeight,
+                superResolutionFrames = finishResult.superResolutionFrames,
+                superResolutionUri = finishResult.superResolutionUri,
+                fusionPreviewUri = finishResult.fusionPreviewUri,
+            ),
         )
     }
 
@@ -1728,6 +1844,7 @@ class Camera2PreviewController(
 
     private fun closeActiveResources() {
         activeRawBurst?.let { burst ->
+            runCatching { rawFrameWriter?.finishBurst(burst.burstId) }
             burst.pendingImages.values.forEach(Image::close)
             burst.pendingImages.clear()
             burst.pendingResults.clear()

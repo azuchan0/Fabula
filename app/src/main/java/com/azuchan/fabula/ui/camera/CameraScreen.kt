@@ -1,14 +1,18 @@
 package com.azuchan.fabula.ui.camera
 
 import android.Manifest
+import android.app.Activity
 import android.app.Application
+import android.content.ActivityNotFoundException
 import android.content.ContentValues
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.hardware.camera2.CameraMetadata
 import android.net.Uri
 import android.os.Environment
 import android.provider.MediaStore
+import android.provider.Settings
 import android.util.Size
 import android.view.MotionEvent
 import android.view.Surface
@@ -54,6 +58,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -74,6 +79,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.core.content.ContextCompat
+import androidx.core.app.ActivityCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -104,6 +110,7 @@ import kotlin.math.roundToLong
 @Composable
 fun CameraScreen() {
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
 
     var hasCameraPermission by remember {
         mutableStateOf(
@@ -113,13 +120,39 @@ fun CameraScreen() {
             ) == PackageManager.PERMISSION_GRANTED,
         )
     }
+    var permissionPermanentlyDenied by remember { mutableStateOf(false) }
+    var permissionRequested by remember { mutableStateOf(false) }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission(),
         onResult = { granted ->
             hasCameraPermission = granted
+            if (granted) {
+                permissionPermanentlyDenied = false
+            } else {
+                permissionPermanentlyDenied = (context as? Activity)?.let { activity ->
+                    permissionRequested && !ActivityCompat.shouldShowRequestPermissionRationale(
+                        activity,
+                        Manifest.permission.CAMERA,
+                    )
+                } == true
+            }
         },
     )
+
+    DisposableEffect(context, lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                hasCameraPermission = ContextCompat.checkSelfPermission(
+                    context,
+                    Manifest.permission.CAMERA,
+                ) == PackageManager.PERMISSION_GRANTED
+                if (hasCameraPermission) permissionPermanentlyDenied = false
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
 
     if (hasCameraPermission) {
         CameraPreview()
@@ -132,17 +165,26 @@ fun CameraScreen() {
             verticalArrangement = Arrangement.Center,
         ) {
             Text(
-                text = "Fabula needs camera access to display the viewfinder.",
+                text = if (permissionPermanentlyDenied) {
+                    "Camera access is disabled for Fabula. Enable it in app settings to use the camera."
+                } else {
+                    "Fabula needs camera access to display the viewfinder."
+                },
                 style = MaterialTheme.typography.bodyLarge,
             )
 
             Button(
                 modifier = Modifier.padding(top = 16.dp),
                 onClick = {
-                    permissionLauncher.launch(Manifest.permission.CAMERA)
+                    if (permissionPermanentlyDenied) {
+                        openAppSettings(context)
+                    } else {
+                        permissionRequested = true
+                        permissionLauncher.launch(Manifest.permission.CAMERA)
+                    }
                 },
             ) {
-                Text("Grant camera access")
+                Text(if (permissionPermanentlyDenied) "Open app settings" else "Grant camera access")
             }
         }
     }
@@ -174,7 +216,11 @@ private fun CameraPreview() {
     var currentDisplayRotation by remember { mutableIntStateOf(Surface.ROTATION_0) }
     var currentViewWidth by remember { mutableIntStateOf(0) }
     var currentViewHeight by remember { mutableIntStateOf(0) }
+    var rawBurstFrameCount by remember { mutableIntStateOf(8) }
     var captureMessage by remember { mutableStateOf<String?>(null) }
+    var savedTiffUri by remember { mutableStateOf<Uri?>(null) }
+    var savedPreviewUri by remember { mutableStateOf<Uri?>(null) }
+    var outputOpenError by remember { mutableStateOf<String?>(null) }
     var showDiagnostics by remember { mutableStateOf(false) }
     var showExposureControls by remember { mutableStateOf(false) }
     val latestHolder = rememberUpdatedState(currentHolder)
@@ -186,6 +232,9 @@ private fun CameraPreview() {
         controller.captureEvents.collect { event ->
             when (event) {
                 is CameraCaptureEvent.JpegReady -> {
+                    savedTiffUri = null
+                    savedPreviewUri = null
+                    outputOpenError = null
                     captureMessage = "Saving photo…"
                     captureMessage = try {
                         saveJpegToMediaStore(context.applicationContext, event.bytes)
@@ -199,10 +248,32 @@ private fun CameraPreview() {
                     captureMessage = "Capture failed: ${event.message}"
                 }
 
-                is CameraCaptureEvent.RawBurstProgress -> Unit
+                is CameraCaptureEvent.RawBurstProgress -> {
+                    if (event.savedFrames == 0) {
+                        savedTiffUri = null
+                        savedPreviewUri = null
+                        outputOpenError = null
+                    }
+                }
 
                 is CameraCaptureEvent.RawBurstFinished -> {
-                    captureMessage = "RAW burst complete: ${event.savedFrames}/${event.totalFrames} DNG files saved."
+                    savedTiffUri = event.superResolutionUri?.let(Uri::parse)
+                    savedPreviewUri = event.fusionPreviewUri?.let(Uri::parse)
+                    outputOpenError = null
+                    val outputs = buildList {
+                        if (event.superResolutionWidth > 0 && event.superResolutionHeight > 0) {
+                            val megapixels = (event.superResolutionWidth.toLong() *
+                                event.superResolutionHeight + 500_000L) / 1_000_000L
+                            add("${megapixels} MP 2× TIFF prototype (${event.superResolutionFrames} aligned frames)")
+                        }
+                        if (event.fusionPreviewSaved) add("fusion preview")
+                    }
+                    val fusionMessage = if (outputs.isNotEmpty()) {
+                        " Fusion saved: ${outputs.joinToString(" + ")}."
+                    } else " No fused output could be created."
+                    captureMessage =
+                        "RAW burst complete: ${event.savedFrames}/${event.totalFrames} DNG files saved." +
+                            fusionMessage
                 }
             }
         }
@@ -217,7 +288,7 @@ private fun CameraPreview() {
     DisposableEffect(lifecycleOwner, controller) {
         val lifecycleObserver = LifecycleEventObserver { _, event ->
             when (event) {
-                Lifecycle.Event.ON_START -> {
+                Lifecycle.Event.ON_RESUME -> {
                     latestHolder.value?.let { holder ->
                         controller.startPreview(
                             holder,
@@ -305,7 +376,7 @@ private fun CameraPreview() {
                                     currentViewHeight = previewView.height
                                     if (currentViewWidth > 0 && currentViewHeight > 0 &&
                                         lifecycleOwner.lifecycle.currentState
-                                            .isAtLeast(Lifecycle.State.STARTED)
+                                            .isAtLeast(Lifecycle.State.RESUMED)
                                     ) {
                                         controller.startPreview(
                                             holder,
@@ -324,8 +395,10 @@ private fun CameraPreview() {
                                 ) = Unit
 
                                 override fun surfaceDestroyed(holder: SurfaceHolder) {
-                                    if (currentHolder === holder) currentHolder = null
-                                    controller.stopPreview()
+                                    if (currentHolder === holder) {
+                                        currentHolder = null
+                                        controller.stopPreview()
+                                    }
                                 }
                             },
                         )
@@ -338,7 +411,7 @@ private fun CameraPreview() {
                                 val holder = previewView.holder
                                 if (holder.surface.isValid &&
                                     lifecycleOwner.lifecycle.currentState
-                                        .isAtLeast(Lifecycle.State.STARTED)
+                                        .isAtLeast(Lifecycle.State.RESUMED)
                                 ) {
                                     controller.startPreview(
                                         holder,
@@ -410,8 +483,7 @@ private fun CameraPreview() {
             }
 
             captureMessage?.let { message ->
-                Text(
-                    text = message,
+                Column(
                     modifier = Modifier
                         .padding(bottom = 8.dp)
                         .background(
@@ -419,23 +491,97 @@ private fun CameraPreview() {
                             shape = RoundedCornerShape(12.dp),
                         )
                         .padding(horizontal = 12.dp, vertical = 8.dp),
-                    color = MaterialTheme.colorScheme.onSurface,
-                    style = MaterialTheme.typography.labelMedium,
-                )
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    Text(
+                        text = message,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        style = MaterialTheme.typography.labelMedium,
+                    )
+                    if (savedTiffUri != null || savedPreviewUri != null) {
+                        Row(horizontalArrangement = Arrangement.Center) {
+                            savedTiffUri?.let { uri ->
+                                TextButton(
+                                    onClick = {
+                                        outputOpenError = openSavedImage(context, uri, "image/tiff")
+                                    },
+                                ) { Text("Open 2× TIFF") }
+                            }
+                            savedPreviewUri?.let { uri ->
+                                TextButton(
+                                    onClick = {
+                                        outputOpenError = openSavedImage(context, uri, "image/jpeg")
+                                    },
+                                ) { Text("Open preview") }
+                            }
+                        }
+                    }
+                    outputOpenError?.let { error ->
+                        Text(
+                            text = error,
+                            color = MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                }
             }
 
             val streamingState = previewState as? CameraPreviewState.Streaming
             val rawCaptureSize = streamingState?.rawCaptureSize
+            val rawBurstCapturing = rawBurstState is RawBurstState.Capturing
             val rawBurstStatus = when (val burst = rawBurstState) {
                 RawBurstState.Idle -> if (rawCaptureSize != null) {
-                    "RAW ${rawCaptureSize.width}×${rawCaptureSize.height} ready"
+                    "RAW ${rawCaptureSize.width}×${rawCaptureSize.height} advertised"
                 } else {
                     "RAW unavailable in this camera session"
                 }
-                is RawBurstState.Capturing -> "RAW burst · ${burst.savedFrames}/${burst.totalFrames}"
+                is RawBurstState.Capturing -> if (burst.finalizing) {
+                    "Reconstructing 2× TIFF · ${burst.savedFrames}/${burst.totalFrames}"
+                } else {
+                    "RAW burst · ${burst.savedFrames}/${burst.totalFrames}"
+                }
                 is RawBurstState.Completed ->
-                    "DNG files saved · ${burst.savedFrames}/${burst.totalFrames} — Pictures/Fabula/RAW_Burst_${burst.burstId}"
+                    run {
+                        val outputs = buildList {
+                            if (burst.superResolutionWidth > 0 && burst.superResolutionHeight > 0) {
+                                val megapixels = (burst.superResolutionWidth.toLong() *
+                                    burst.superResolutionHeight + 500_000L) / 1_000_000L
+                                add("${megapixels} MP 2× TIFF · ${burst.superResolutionFrames} frames")
+                            }
+                            if (burst.fusionPreviewSaved) add("preview")
+                        }
+                        "DNG files saved · ${burst.savedFrames}/${burst.totalFrames}" +
+                            (if (outputs.isNotEmpty()) " · ${outputs.joinToString(" + ")}" else "") +
+                            " — Pictures/Fabula/RAW_Burst_${burst.burstId}"
+                    }
                 is RawBurstState.Failed -> "RAW burst: ${burst.message}"
+            }
+
+            if (rawCaptureSize != null) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState())
+                        .padding(horizontal = 16.dp),
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = "Frames",
+                        modifier = Modifier.padding(end = 8.dp),
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    listOf(8, 12, 15).forEach { count ->
+                        FilterChip(
+                            selected = rawBurstFrameCount == count,
+                            enabled = !rawBurstCapturing,
+                            onClick = { rawBurstFrameCount = count },
+                            label = { Text(count.toString()) },
+                            modifier = Modifier.padding(end = 8.dp),
+                        )
+                    }
+                }
             }
 
             FilledTonalButton(
@@ -443,12 +589,16 @@ private fun CameraPreview() {
                     .padding(horizontal = 20.dp)
                     .fillMaxWidth(),
                 enabled = rawCaptureSize != null &&
-                    rawBurstState !is RawBurstState.Capturing,
-                onClick = { controller.captureRawBurst(frameCount = 8) },
+                    !rawBurstCapturing,
+                onClick = { controller.captureRawBurst(frameCount = rawBurstFrameCount) },
             ) {
                 val label = (rawBurstState as? RawBurstState.Capturing)?.let {
-                    "RAW burst · ${it.savedFrames}/${it.totalFrames}"
-                } ?: "Capture 8 RAW frames"
+                    if (it.finalizing) {
+                        "Reconstructing 2× TIFF…"
+                    } else {
+                        "RAW burst · ${it.savedFrames}/${it.totalFrames}"
+                    }
+                } ?: "Capture $rawBurstFrameCount RAW frames"
                 Text(label)
             }
             Text(
@@ -457,6 +607,14 @@ private fun CameraPreview() {
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+            if (rawCaptureSize != null) {
+                Text(
+                    text = "Every DNG is kept; the TIFF uses frames with reliable alignment.",
+                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 2.dp),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
 
             Row(
                 modifier = Modifier
@@ -469,7 +627,7 @@ private fun CameraPreview() {
                     modifier = Modifier.size(56.dp),
                     shape = CircleShape,
                     contentPadding = PaddingValues(0.dp),
-                    enabled = previewState is CameraPreviewState.Streaming,
+                    enabled = previewState is CameraPreviewState.Streaming && !rawBurstCapturing,
                     onClick = { showExposureControls = true },
                 ) {
                     Text("EV")
@@ -479,7 +637,7 @@ private fun CameraPreview() {
                     modifier = Modifier
                         .size(72.dp)
                         .semantics { contentDescription = "Take a photo" },
-                    enabled = previewState is CameraPreviewState.Streaming,
+                    enabled = previewState is CameraPreviewState.Streaming && !rawBurstCapturing,
                     shape = CircleShape,
                     contentPadding = PaddingValues(0.dp),
                     onClick = controller::captureJpeg,
@@ -1139,6 +1297,26 @@ private fun CameraPreviewState.label(): String = when (this) {
     CameraPreviewState.Opening -> "Opening camera…"
     is CameraPreviewState.Streaming -> "Preview active · ${previewSize.width}×${previewSize.height}"
     is CameraPreviewState.Error -> "Camera error · $message"
+}
+
+private fun openSavedImage(context: Context, uri: Uri, mimeType: String): String? = try {
+    context.startActivity(
+        Intent(Intent.ACTION_VIEW)
+            .setDataAndType(uri, mimeType)
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK),
+    )
+    null
+} catch (_: ActivityNotFoundException) {
+    "No installed app can open this $mimeType file. The original remains saved in Pictures/Fabula."
+} catch (exception: SecurityException) {
+    "Could not grant access to the saved image: ${exception.message ?: "permission denied"}"
+}
+
+private fun openAppSettings(context: Context) {
+    val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+        .setData(Uri.fromParts("package", context.packageName, null))
+        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    runCatching { context.startActivity(intent) }
 }
 
 private suspend fun saveJpegToMediaStore(context: Context, jpegBytes: ByteArray): Uri =
