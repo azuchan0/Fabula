@@ -8,6 +8,11 @@
 **/build/
 local.properties
 
+# Release signing: the keystore and its passwords never go into git
+keystore.properties
+*.jks
+*.keystore
+
 # Android / native build outputs
 .externalNativeBuild/
 .cxx/

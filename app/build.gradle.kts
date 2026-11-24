@@ -1,6 +1,15 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.compose.compiler)
+}
+
+// Release signing comes from keystore.properties at the project root (git-ignored):
+// storeFile, storePassword, keyAlias, keyPassword. Without it, release builds stay unsigned.
+val keystoreProperties = Properties().apply {
+    val file = rootProject.file("keystore.properties")
+    if (file.isFile) file.inputStream().use(::load)
 }
 
 android {
@@ -18,11 +27,25 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    signingConfigs {
+        if (keystoreProperties.getProperty("storeFile") != null) {
+            create("release") {
+                storeFile = file(keystoreProperties.getProperty("storeFile"))
+                storePassword = keystoreProperties.getProperty("storePassword")
+                keyAlias = keystoreProperties.getProperty("keyAlias")
+                keyPassword = keystoreProperties.getProperty("keyPassword")
+            }
+        }
+    }
+
     buildTypes {
         release {
+            signingConfig = signingConfigs.findByName("release")
+            // Whole-app R8: scoping it to library packages produced classes extending
+            // inaccessible renamed Kotlin classes (IllegalAccessError at startup). JNI entry
+            // points stay intact through the default keep rules for native methods.
             optimization {
                 enable = true
-                packageScope = setOf("androidx.**", "kotlin.**", "kotlinx.**")
             }
         }
     }
@@ -44,6 +67,14 @@ android {
         }
     }
 }
+
+// The signed release is also delivered as app/build/outputs/fabula/fabula.apk.
+val fabulaReleaseApk = tasks.register<Copy>("fabulaReleaseApk") {
+    from(layout.buildDirectory.file("outputs/apk/release/app-release.apk"))
+    rename { "fabula.apk" }
+    into(layout.buildDirectory.dir("outputs/fabula"))
+}
+tasks.matching { it.name == "assembleRelease" }.configureEach { finalizedBy(fabulaReleaseApk) }
 
 kotlin {
     compilerOptions {
