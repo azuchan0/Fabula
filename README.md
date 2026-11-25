@@ -4,7 +4,7 @@
   <img src="docs/screenshot.png" alt="Fabula viewfinder" width="360">
 </p>
 
-Fabula is an Android camera app with a pro-camera interface, built with **Kotlin**, **Jetpack Compose** and the **Camera2 API**. It is developed on a Pixel 9a; features the phone's camera does not expose are greyed out.
+Fabula is an Android camera app with a pro-camera interface, built with **Kotlin**, **Jetpack Compose** and the **Camera2 API**. It is developed for my Pixel 9a. Features the phone's camera does not expose are greyed out.
 
 ## Features
 
